@@ -1,0 +1,103 @@
+#!/usr/bin/env bash
+# code-router-refresh-token -- mint a fresh OAuth bearer token from Okta and
+# atomically write it to ~/.claude-code-router/token.txt. The CCR daemon
+# reads this file per-request via the `inject-token` plugin, so token
+# rotation is invisible to in-flight sessions and the daemon does NOT need
+# to be restarted.
+#
+# Also (first-run only) materializes the static CCR config that points the
+# daemon at the gateway and wires up our transformer chain.
+#
+# Source-of-truth credentials live in shepherd's config (single source).
+
+set -euo pipefail
+
+SHEPHERD_CFG="${SHEPHERD_CFG:-$HOME/.config/shepherd/config.json}"
+CCR_DIR="$HOME/.claude-code-router"
+CCR_CFG="$CCR_DIR/config.json"
+TOKEN_FILE="$CCR_DIR/token.txt"
+CA_FILE="$HOME/.local/share/ca-certs/code-router-ca.pem"
+PLUGIN_DIR="$CCR_DIR/plugins"
+
+if [[ ! -r "$SHEPHERD_CFG" ]]; then
+  echo "code-router-refresh-token: $SHEPHERD_CFG not readable" >&2
+  exit 1
+fi
+
+read_field() { jq -r --arg f "$1" '.providers[0][$f]' "$SHEPHERD_CFG"; }
+
+CLIENT_ID="$(read_field client_id)"
+CLIENT_SECRET="$(read_field client_secret)"
+TOKEN_URL="$(read_field token_url)"
+TOKEN_SCOPE="$(read_field token_scope)"
+BASE_URL="$(read_field base_url)"
+DEPLOYMENT="$(read_field deployment_name)"
+API_VERSION="$(read_field api_version)"
+MODEL="$(read_field model)"
+
+# --- Mint a fresh OAuth bearer token ---
+CURL_OPTS=(-sSf -X POST "$TOKEN_URL"
+  -u "$CLIENT_ID:$CLIENT_SECRET"
+  -d "grant_type=client_credentials&scope=$TOKEN_SCOPE")
+if [[ -r "$CA_FILE" ]]; then
+  CURL_OPTS+=(--cacert "$CA_FILE")
+else
+  CURL_OPTS+=(-k)
+fi
+
+TOKEN_JSON="$(curl "${CURL_OPTS[@]}")"
+ACCESS_TOKEN="$(jq -r '.access_token' <<<"$TOKEN_JSON")"
+EXPIRES_IN="$(jq -r '.expires_in // "?"' <<<"$TOKEN_JSON")"
+if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
+  echo "code-router-refresh-token: token mint failed" >&2
+  jq . <<<"$TOKEN_JSON" >&2
+  exit 1
+fi
+
+# --- Atomically publish the token (write+rename so readers never see a
+#     half-written file). The inject-token plugin reads this every 5s. ---
+mkdir -p "$CCR_DIR"
+umask 077
+TMP="$(mktemp "$CCR_DIR/.token.XXXXXX")"
+printf '%s\n' "$ACCESS_TOKEN" >"$TMP"
+chmod 600 "$TMP"
+mv -f "$TMP" "$TOKEN_FILE"
+
+# --- First-run bootstrap: write the static CCR config if it doesn't exist
+#     (or if it's clearly stale -- doesn't reference the inject-token plugin).
+#     The api_key here is a placeholder; inject-token overrides per request.
+COMPLETIONS_URL="${BASE_URL}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=${API_VERSION}"
+need_bootstrap=0
+if [[ ! -r "$CCR_CFG" ]]; then
+  need_bootstrap=1
+elif ! grep -q "inject-token" "$CCR_CFG" 2>/dev/null; then
+  need_bootstrap=1
+fi
+
+if (( need_bootstrap )); then
+  jq -n \
+    --arg url "$COMPLETIONS_URL" \
+    --arg model "$MODEL" \
+    --arg plugin_strip "$PLUGIN_DIR/strip-reasoning.js" \
+    --arg plugin_inject "$PLUGIN_DIR/inject-token.js" \
+    '{
+      LOG: false,
+      API_TIMEOUT_MS: 600000,
+      transformers: [
+        { path: $plugin_strip },
+        { path: $plugin_inject }
+      ],
+      Providers: [{
+        name: "azprod",
+        api_base_url: $url,
+        api_key: "PLACEHOLDER_OVERRIDDEN_BY_INJECT_TOKEN",
+        models: [$model],
+        transformer: { use: ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"] }
+      }],
+      Router: { default: ("azprod," + $model) }
+    }' >"$CCR_CFG"
+  chmod 600 "$CCR_CFG"
+  echo "code-router: wrote static config -> $CCR_CFG"
+fi
+
+echo "code-router: token refreshed (expires in ${EXPIRES_IN}s)"

@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+# icode -- run Claude Code through claude-code-router (CCR), routing
+# requests to the OpenAI-compatible gateway configured in shepherd.
+#
+# Token refresh and config materialization are handled by the
+# code-router.timer systemd user unit; this script just sources nvm
+# so Node 22 is on PATH and execs `ccr code`.
+
+set -euo pipefail
+
+NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+CCR_CFG="$HOME/.claude-code-router/config.json"
+REFRESH_BIN="$HOME/bin/code-router-refresh-token"
+
+# If config doesn't exist (fresh install or after uninstall), mint it now.
+if [[ ! -r "$CCR_CFG" ]]; then
+  if [[ -x "$REFRESH_BIN" ]]; then
+    "$REFRESH_BIN"
+  else
+    echo "icode: $CCR_CFG missing and $REFRESH_BIN not found" >&2
+    echo "       run 'make install' from the code-router project" >&2
+    exit 1
+  fi
+fi
+
+if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+  # nvm refuses to load when the PREFIX env var is set (e.g. when invoked
+  # from a worker process that has its own PREFIX). Strip it.
+  unset PREFIX
+  # shellcheck disable=SC1091
+  . "$NVM_DIR/nvm.sh"
+  nvm use --delete-prefix --silent 22 >/dev/null
+fi
+
+# Trust the corporate CA bundle the timer installed at fetch time.
+CA_FILE="$HOME/.local/share/ca-certs/code-router-ca.pem"
+if [[ -r "$CA_FILE" ]]; then
+  export NODE_EXTRA_CA_CERTS="$CA_FILE"
+fi
+
+# Bump the Read tool's per-call token cap from the default 25k to 128k so
+# large MCP tool results (e.g. read_workpaper dumping a multi-sheet xlsx)
+# don't blow up the model's ingestion path. Caller can override.
+export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-128000}"
+
+exec ccr code "$@"

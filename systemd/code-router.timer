@@ -1,0 +1,11 @@
+[Unit]
+Description=Refresh code-router OAuth token every 30 minutes
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=30m
+Unit=code-router.service
+Persistent=true
+
+[Install]
+WantedBy=timers.target

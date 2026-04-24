@@ -1,0 +1,50 @@
+{
+  "name": "@musistudio/claude-code-router",
+  "version": "2.0.0",
+  "description": "Use Claude Code without an Anthropics account and route it to another LLM provider",
+  "scripts": {
+    "build": "pnpm build:shared && pnpm build:core && pnpm build:server && pnpm build:cli && pnpm build:ui",
+    "build:core": "pnpm --filter @musistudio/llms build",
+    "build:shared": "pnpm --filter @CCR/shared build",
+    "build:cli": "pnpm --filter @CCR/cli build",
+    "build:server": "pnpm --filter @CCR/server build",
+    "build:ui": "pnpm --filter @CCR/ui build",
+    "build:docs": "pnpm --filter claude-code-router-docs build",
+    "release": "pnpm build && bash scripts/release.sh all",
+    "release:npm": "bash scripts/release.sh npm",
+    "release:docker": "bash scripts/release.sh docker",
+    "dev:cli": "pnpm --filter @CCR/cli dev",
+    "dev:server": "pnpm --filter @CCR/server dev",
+    "dev:ui": "pnpm --filter @CCR/ui dev",
+    "dev:core": "pnpm --filter @musistudio/llms dev",
+    "dev:docs": "pnpm --filter claude-code-router-docs start",
+    "serve:docs": "pnpm --filter claude-code-router-docs serve"
+  },
+  "bin": {
+    "ccr": "dist/cli.js"
+  },
+  "keywords": [
+    "claude",
+    "code",
+    "router",
+    "llm",
+    "anthropic"
+  ],
+  "author": "musistudio",
+  "license": "MIT",
+  "devDependencies": {
+    "@types/node": "^24.0.15",
+    "esbuild": "^0.25.1",
+    "shx": "^0.4.0",
+    "typescript": "^5.8.2"
+  },
+  "pnpm": {
+    "overrides": {
+      "@types/react": "18"
+    }
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "pnpm": ">=8.0.0"
+  }
+}
