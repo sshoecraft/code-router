@@ -1,0 +1,15 @@
+code-router bundles third-party software. The notices below are reproduced
+here for attribution; each component's full license text ships alongside
+its source.
+
+================================================================================
+claude-code-router
+================================================================================
+
+Path:       router/
+Upstream:   https://github.com/musistudio/claude-code-router
+License:    MIT (see router/LICENSE)
+Copyright:  (c) 2025 musistudio
+
+This repository vendors a patched copy of claude-code-router. See
+router/RESTART-FIX.md for the list of local modifications.
