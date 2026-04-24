@@ -37,11 +37,15 @@ daemon; nothing kills them.
 
 ## Prerequisites
 
+- Linux, or **Windows with WSL2** (shell scripts and systemd user timer
+  are Linux-only; running under WSL2 is supported and tested)
 - `jq`, `curl`, `openssl` on PATH
 - `~/.config/shepherd/config.json` populated with the gateway provider entry
   (this is the single source of truth for client_id, client_secret,
   token_url, scope, base_url, deployment_name, api_version, model)
-- `systemd` user instance (default on Linux desktops/servers)
+- `systemd` user instance (default on Linux desktops/servers; WSL2 needs
+  `systemd=true` in `/etc/wsl.conf` — enabled by default in recent
+  Windows 11 / WSL releases)
 
 ## Install
 
