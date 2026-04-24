@@ -11,7 +11,7 @@
 SHELL := /bin/bash
 
 PREFIX        ?= $(HOME)
-BIN_DIR       ?= $(PREFIX)/bin
+BIN_DIR       ?= $(PREFIX)/.local/bin
 SYSTEMD_DIR   ?= $(PREFIX)/.config/systemd/user
 CCR_DIR       ?= $(PREFIX)/.claude-code-router
 PLUGIN_DIR    ?= $(CCR_DIR)/plugins

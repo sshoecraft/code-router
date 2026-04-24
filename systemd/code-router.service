@@ -9,6 +9,6 @@ Type=oneshot
 # this env, so the corporate CA bundle MUST be exported here -- otherwise
 # the freshly spawned daemon cannot validate TLS to the upstream gateway.
 Environment=NODE_EXTRA_CA_CERTS=%h/.local/share/ca-certs/code-router-ca.pem
-ExecStart=%h/bin/code-router-refresh-token
+ExecStart=%h/.local/bin/code-router-refresh-token
 StandardOutput=journal
 StandardError=journal

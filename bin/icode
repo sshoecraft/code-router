@@ -10,7 +10,7 @@ set -euo pipefail
 
 NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 CCR_CFG="$HOME/.claude-code-router/config.json"
-REFRESH_BIN="$HOME/bin/code-router-refresh-token"
+REFRESH_BIN="$HOME/.local/bin/code-router-refresh-token"
 
 # If config doesn't exist (fresh install or after uninstall), mint it now.
 if [[ ! -r "$CCR_CFG" ]]; then

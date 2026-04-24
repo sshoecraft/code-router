@@ -58,7 +58,8 @@ The Makefile will:
    see `router/RESTART-FIX.md`) and install it user-global via `npm i -g`
 3. Fetch the corporate CA chain from the gateway and store it at
    `~/.local/share/ca-certs/code-router-ca.pem`
-4. Install `~/bin/icode` and `~/bin/code-router-refresh-token`
+4. Install `~/.local/bin/icode` and `~/.local/bin/code-router-refresh-token`
+   (same dir Claude Code uses; on PATH by default on modern Linux)
 5. Install the `strip-reasoning` custom CCR transformer
 6. Install + enable `code-router.timer` (refresh every 30 min, on boot)
 7. Mint the initial token and write `~/.claude-code-router/config.json`
@@ -85,8 +86,8 @@ to remove them are printed).
 
 | Path                                              | Purpose                                    |
 |---------------------------------------------------|--------------------------------------------|
-| `~/bin/icode`                                     | Claude Code launcher (sources nvm + execs ccr) |
-| `~/bin/code-router-refresh-token`                 | Token mint + config write + daemon restart |
+| `~/.local/bin/icode`                              | Claude Code launcher (sources nvm + execs ccr) |
+| `~/.local/bin/code-router-refresh-token`          | Token mint + config write + daemon restart |
 | `~/.claude-code-router/config.json`               | CCR config (mode 0600, contains live token)|
 | `~/.claude-code-router/plugins/strip-reasoning.js`| Custom transformer                         |
 | `~/.local/share/ca-certs/code-router-ca.pem`      | Corporate CA chain                         |
@@ -110,7 +111,7 @@ to remove them are printed).
 - **Don't run `ccr restart` from an arbitrary shell.** The daemon it
   spawns inherits the caller's env, and the corporate CA bundle has to
   be in `NODE_EXTRA_CA_CERTS` for TLS to the upstream gateway to work.
-  Use `~/bin/code-router-refresh-token` (or just let the timer fire) --
+  Use `~/.local/bin/code-router-refresh-token` (or just let the timer fire) --
   it sets the env before calling `ccr restart`.
 
 ## Porting to another node
