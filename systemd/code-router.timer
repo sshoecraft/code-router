@@ -2,8 +2,13 @@
 Description=Refresh code-router OAuth token every 30 minutes
 
 [Timer]
+# Fire on the wall clock at :00 and :30 every hour. Wall-clock anchors are
+# self-healing: even if the service has not run for days, the next half-hour
+# slot still triggers. The previous OnUnitActiveSec=30m anchor required a
+# prior successful run, so a single missed refresh (sleep, reboot, transient
+# failure) wedged the timer with `Trigger: n/a` until manually kicked.
 OnBootSec=30s
-OnUnitActiveSec=30m
+OnCalendar=*:0/30
 Unit=code-router.service
 Persistent=true
 
