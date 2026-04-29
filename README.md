@@ -90,6 +90,23 @@ daemon; nothing kills them.
 
 ## Install
 
+There are two install modes — pick one (or run both, they coexist):
+
+- **Per-user install** (`make install`, no sudo). nvm/Node 22 user-local;
+  CCR daemon launched lazily by `ccr code`; state under
+  `~/.claude-code-router`; user-systemd timer rotates the token. Right
+  for laptops, dev machines, single-user boxes.
+- **System install** (`sudo make install-system`). Distro `nodejs` +
+  `npm`; ccr in `/usr/local`; dedicated `code-router` system user runs
+  the daemon at boot; state under `/var/lib/code-router`; system-systemd
+  timer rotates the token. Any user on the box can run `icode`. Right
+  for shared servers and CI hosts.
+
+icode auto-detects which is active per invocation (per-user wins when
+present; otherwise hits the shared system daemon).
+
+### Per-user install
+
 ```bash
 git clone <this-repo> ~/src/code-router  # or scp
 cd ~/src/code-router
@@ -135,15 +152,44 @@ icode                      # interactive
 make status                # timer + daemon health
 ```
 
+### System install
+
+```bash
+git clone <this-repo> /opt/code-router  # or wherever you build from
+cd /opt/code-router
+sudo make install-system                # config-independent setup
+
+# Now create the shared provider config:
+sudo cp config.example.json /etc/icode/config.json
+sudo chown root:code-router /etc/icode/config.json
+sudo chmod 0640 /etc/icode/config.json
+sudo $EDITOR /etc/icode/config.json     # fill in the REPLACE_ME values
+
+sudo make configure-system              # CA fetch, mint token, restart daemon
+```
+
+After this, any user on the box can run `icode`. The daemon runs at
+boot under `code-router.service` and the token is refreshed by
+`code-router-refresh.timer` (every 30 min, on boot, with catch-up).
+
+Provider switching in system mode requires sudo:
+```bash
+sudo /usr/local/bin/code-router-refresh-token --provider NAME
+sudo systemctl restart code-router.service
+```
+…or just `icode --provider NAME` will prompt for sudo and do both.
+
 ## Uninstall
 
 ```bash
-make uninstall
+make uninstall                # per-user install
+sudo make uninstall-system    # system install (leaves /etc/icode + state intact;
+                              # prints how to remove those manually)
 ```
 
-Removes the systemd units, `icode`, `code-router-refresh-token`, the
-plugin, and the cached CA. Leaves nvm/Node 22/CCR in place (instructions
-to remove them are printed).
+Per-user uninstall removes the user systemd units, `icode`,
+`code-router-refresh-token`, the plugins, and the cached CA. Leaves
+nvm/Node 22/CCR in place (instructions to remove them are printed).
 
 ## Files installed
 

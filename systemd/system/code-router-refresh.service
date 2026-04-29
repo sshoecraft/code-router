@@ -1,0 +1,35 @@
+[Unit]
+Description=Refresh OAuth bearer token for the code-router daemon
+Documentation=https://github.com/sshoecraft/code-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=code-router
+Group=code-router
+WorkingDirectory=/var/lib/code-router
+
+# Match the daemon's environment so the script writes to the same paths
+# the daemon will read from. ICODE_CFG points at the system credentials
+# file; CODE_ROUTER_DIR holds active-provider/token.txt; CODE_ROUTER_PLUGIN_DIR
+# is the system-wide read-only plugin install; CODE_ROUTER_CA_FILE is the
+# corporate CA bundle (also installed system-wide).
+Environment=HOME=/var/lib/code-router
+Environment=ICODE_CFG=/etc/icode/config.json
+Environment=CODE_ROUTER_DIR=/var/lib/code-router/.claude-code-router
+Environment=CODE_ROUTER_PLUGIN_DIR=/usr/local/share/code-router/plugins
+Environment=CODE_ROUTER_CA_FILE=/usr/local/share/code-router/ca.pem
+Environment=NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem
+
+ExecStart=/usr/local/bin/code-router-refresh-token
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/code-router
+
+StandardOutput=journal
+StandardError=journal

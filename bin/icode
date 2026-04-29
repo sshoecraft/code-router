@@ -1,22 +1,55 @@
 #!/usr/bin/env bash
-# icode -- run Claude Code through claude-code-router (CCR), routing
-# requests to the active provider configured in ~/.config/icode/config.json.
+# icode -- run Claude Code through claude-code-router (CCR), routing to the
+# active provider configured in the icode config.
 #
-# Both openai and anthropic provider types route through CCR. The vendored
-# Anthropic transformer has been patched to read the bearer token from
-# ANTHROPIC_TOKEN_FILE per request, so token rotation is invisible to
-# in-flight sessions for both flavors.
+# Two install modes are supported:
+#
+#   System install (sudo make install):
+#     ICODE_CFG=/etc/icode/config.json
+#     CCR daemon runs at boot under systemd, port 3456, owned by user
+#     code-router. Provider switching is admin-only (sudo).
+#
+#   Per-user install (make install-user):
+#     ICODE_CFG=$HOME/.config/icode/config.json
+#     CCR daemon is launched lazily by `ccr code` from this script; user
+#     systemd timer rotates the token.
 #
 # Flags consumed here (NOT forwarded to claude-code):
-#   --provider NAME   switch the active provider for this and subsequent runs
+#   --provider NAME   switch the active provider (system mode: requires sudo)
 #   --list            list configured providers and exit
 #   --safe            keep claude-code's permission prompts (default: skip)
 
 set -euo pipefail
 
-NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-CCR_CFG="$HOME/.claude-code-router/config.json"
-REFRESH_BIN="$HOME/.local/bin/code-router-refresh-token"
+# Defaults match per-user install; system install overrides via /etc/profile.d
+# or by sourcing /etc/icode/icode.env. ICODE_CFG falls back to /etc/icode if
+# the user hasn't created their own.
+SYSTEM_CFG="/etc/icode/config.json"
+USER_CFG="${HOME}/.config/icode/config.json"
+if [[ -z "${ICODE_CFG:-}" ]]; then
+  if [[ -r "$USER_CFG" ]]; then
+    ICODE_CFG="$USER_CFG"
+  else
+    ICODE_CFG="$SYSTEM_CFG"
+  fi
+fi
+export ICODE_CFG
+
+# Per-user install wins when present; otherwise fall back to the shared
+# system install. We detect by the location of the refresh script -- it's
+# the most direct signal of which `make install` ran.
+if [[ -x "${HOME}/.local/bin/code-router-refresh-token" ]]; then
+  SYSTEM_MODE=0
+  REFRESH_BIN="${HOME}/.local/bin/code-router-refresh-token"
+  NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  CCR_CFG="${HOME}/.claude-code-router/config.json"
+elif [[ -x "/usr/local/bin/code-router-refresh-token" ]]; then
+  SYSTEM_MODE=1
+  REFRESH_BIN="/usr/local/bin/code-router-refresh-token"
+else
+  echo "icode: no install found -- run 'make install' or 'sudo make install-system'" >&2
+  exit 1
+fi
 
 PROVIDER=""
 SAFE_MODE=0
@@ -31,39 +64,59 @@ while (( $# )); do
   esac
 done
 
-# If config doesn't exist (fresh install) OR the user is switching providers,
-# run the refresh script first.
-if [[ ! -r "$CCR_CFG" || -n "$PROVIDER" ]]; then
-  if [[ -x "$REFRESH_BIN" ]]; then
-    if [[ -n "$PROVIDER" ]]; then
+if [[ -n "$PROVIDER" ]]; then
+  if (( SYSTEM_MODE )); then
+    # System install: refresh-token writes to /var/lib/code-router/, owned
+    # by the code-router user. Need sudo, then restart the daemon so the
+    # new Router.default takes effect.
+    echo "icode: switching provider to '$PROVIDER' (requires sudo)..." >&2
+    sudo "$REFRESH_BIN" --provider "$PROVIDER"
+    sudo systemctl restart code-router.service
+  else
+    if [[ -x "$REFRESH_BIN" ]]; then
       "$REFRESH_BIN" --provider "$PROVIDER"
     else
-      "$REFRESH_BIN"
+      echo "icode: $REFRESH_BIN not found -- run 'make install'" >&2
+      exit 1
     fi
-  else
-    echo "icode: $REFRESH_BIN not found -- run 'make install'" >&2
-    exit 1
   fi
 fi
 
-if [[ -s "$NVM_DIR/nvm.sh" ]]; then
-  # nvm refuses to load when the PREFIX env var is set (e.g. when invoked
-  # from a worker process that has its own PREFIX). Strip it.
-  unset PREFIX
-  # shellcheck disable=SC1091
-  . "$NVM_DIR/nvm.sh"
-  nvm use --delete-prefix --silent 22 >/dev/null
+if (( SYSTEM_MODE )); then
+  # Daemon is started at boot by systemd; it has its own NODE_EXTRA_CA_CERTS
+  # and ANTHROPIC_TOKEN_FILE from the unit file. icode just needs ccr on PATH.
+  if ! command -v ccr >/dev/null 2>&1; then
+    echo "icode: ccr not on PATH (system install incomplete?)" >&2
+    exit 1
+  fi
+else
+  # Per-user mode: bootstrap CCR config on first run; load nvm; set CA bundle
+  # and token file env vars so the daemon (spawned by ccr code) inherits them.
+  if [[ ! -r "$CCR_CFG" ]]; then
+    if [[ -x "$REFRESH_BIN" ]]; then
+      "$REFRESH_BIN"
+    else
+      echo "icode: $REFRESH_BIN not found -- run 'make install-user'" >&2
+      exit 1
+    fi
+  fi
+  if [[ -s "$NVM_DIR/nvm.sh" ]]; then
+    unset PREFIX
+    # shellcheck disable=SC1091
+    . "$NVM_DIR/nvm.sh"
+    nvm use --delete-prefix --silent 22 >/dev/null
+  fi
+  CA_FILE="${HOME}/.local/share/ca-certs/code-router-ca.pem"
+  if [[ -r "$CA_FILE" ]]; then
+    export NODE_EXTRA_CA_CERTS="$CA_FILE"
+  fi
+  export ANTHROPIC_TOKEN_FILE="${HOME}/.claude-code-router/token.txt"
+  # Restart per-user daemon after a provider switch so it picks up the new
+  # Router.default. (System mode handled this via systemctl restart above.)
+  if [[ -n "$PROVIDER" ]]; then
+    ccr restart >/dev/null 2>&1 || true
+  fi
 fi
-
-# Trust the corporate CA bundle the timer installed at fetch time.
-CA_FILE="$HOME/.local/share/ca-certs/code-router-ca.pem"
-if [[ -r "$CA_FILE" ]]; then
-  export NODE_EXTRA_CA_CERTS="$CA_FILE"
-fi
-
-# Tell the patched CCR Anthropic transformer where to read the live bearer
-# token from. The daemon inherits this when spawned by `ccr code`.
-export ANTHROPIC_TOKEN_FILE="$HOME/.claude-code-router/token.txt"
 
 # Bump the Read tool's per-call token cap from the default 25k to 128k so
 # large MCP tool results (e.g. read_workpaper dumping a multi-sheet xlsx)
@@ -73,14 +126,6 @@ export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTP
 SKIP_PERMS=()
 if (( ! SAFE_MODE )); then
   SKIP_PERMS=(--dangerously-skip-permissions)
-fi
-
-# A provider switch changed Router.default, but a running CCR daemon caches
-# its config in memory -- restart it so the new routing takes effect.
-# Plain token rotation doesn't need a restart; that's handled per-request
-# by the inject-token plugin / patched Anthropic transformer.
-if [[ -n "$PROVIDER" ]]; then
-  ccr restart >/dev/null 2>&1 || true
 fi
 
 exec ccr code ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}

@@ -1,0 +1,16 @@
+[Unit]
+Description=Periodic OAuth token refresh for code-router daemon
+Documentation=https://github.com/sshoecraft/code-router
+
+[Timer]
+# Mint a token shortly after boot so the daemon comes up with a valid
+# token immediately, then refresh every 30 min. Token TTL is 3600s so we
+# always have at least 30 min of headroom.
+OnBootSec=10s
+OnUnitActiveSec=30min
+# Catch up after suspend / missed runs.
+Persistent=true
+Unit=code-router-refresh.service
+
+[Install]
+WantedBy=timers.target

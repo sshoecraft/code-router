@@ -65,14 +65,20 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 
+# Paths are env-var-driven so the same script serves both per-user installs
+# (defaults below) and system installs (the systemd unit sets the env vars
+# to point at /etc/icode, /var/lib/code-router, /usr/local/share/...).
 HOME = Path.home()
 ICODE_CFG = Path(os.environ.get("ICODE_CFG", HOME / ".config" / "icode" / "config.json"))
-CCR_DIR = HOME / ".claude-code-router"
+CCR_DIR = Path(os.environ.get("CODE_ROUTER_DIR", HOME / ".claude-code-router"))
 CCR_CFG = CCR_DIR / "config.json"
 TOKEN_FILE = CCR_DIR / "token.txt"
 ACTIVE_FILE = CCR_DIR / "active-provider"
-CA_FILE = HOME / ".local" / "share" / "ca-certs" / "code-router-ca.pem"
-PLUGIN_DIR = CCR_DIR / "plugins"
+CA_FILE = Path(os.environ.get(
+    "CODE_ROUTER_CA_FILE",
+    HOME / ".local" / "share" / "ca-certs" / "code-router-ca.pem",
+))
+PLUGIN_DIR = Path(os.environ.get("CODE_ROUTER_PLUGIN_DIR", CCR_DIR / "plugins"))
 SUPPORTED_TYPES = ("openai", "anthropic")
 
 

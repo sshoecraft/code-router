@@ -1,12 +1,30 @@
-# code-router -- run Claude Code against an OAuth-gated, OpenAI-compatible
-# Azure-OpenAI gateway via claude-code-router (CCR), with OAuth token
-# refresh handled by a systemd user timer.
+# code-router -- run Claude Code against an OAuth-gated gateway via
+# claude-code-router (CCR), with token refresh handled by systemd.
 #
-# Usage:
-#   make install      # full install (default)
-#   make uninstall    # remove all files & disable timer
-#   make status       # show service/timer/daemon status
-#   make refresh      # mint a fresh token now (manual override)
+# Two install modes:
+#
+#   Per-user (no sudo):
+#     make install            # nvm/Node 22 user-local, ccr installed under
+#                             # nvm; daemon launched lazily by `ccr code`;
+#                             # state under ~/.claude-code-router; user
+#                             # systemd timer rotates the token.
+#     make uninstall
+#
+#   System-wide (sudo):
+#     sudo make install-system   # apt install nodejs npm (if missing); ccr
+#                                # to /usr/local; dedicated `code-router`
+#                                # system user runs the daemon at boot;
+#                                # state under /var/lib/code-router; system
+#                                # systemd timer rotates the token.
+#                                # Any user on the box can run `icode`.
+#     sudo make uninstall-system
+#
+# Both modes can coexist on the same machine; icode prefers the per-user
+# install when one exists, otherwise hits the shared system daemon.
+#
+# Other targets:
+#   make status       # show service/timer/daemon status (per-user)
+#   make refresh      # mint a fresh token now (per-user, manual override)
 
 SHELL := /bin/bash
 
@@ -23,9 +41,24 @@ NODE_VERSION  ?= 22
 NVM_VERSION   ?= v0.40.3
 ROUTER_SRC    := $(CURDIR)/router
 
+# System-mode paths (used by install-system / uninstall-system targets).
+SYS_BIN_DIR     ?= /usr/local/bin
+SYS_SHARE_DIR   ?= /usr/local/share/code-router
+SYS_PLUGIN_DIR  ?= $(SYS_SHARE_DIR)/plugins
+SYS_CA_FILE     ?= $(SYS_SHARE_DIR)/ca.pem
+SYS_CFG_DIR     ?= /etc/icode
+SYS_CFG         ?= $(SYS_CFG_DIR)/config.json
+SYS_STATE_DIR   ?= /var/lib/code-router
+SYS_SYSTEMD_DIR ?= /etc/systemd/system
+SYS_USER        ?= code-router
+
 .PHONY: install uninstall status refresh check-prereqs install-node \
         install-router install-bin install-plugin install-ca install-systemd \
-        configure
+        configure \
+        install-system uninstall-system check-prereqs-system \
+        install-system-user install-system-dirs install-system-bin \
+        install-system-plugin install-system-router install-system-ca \
+        install-system-systemd configure-system
 
 install: check-prereqs install-node install-router install-bin install-plugin \
          install-systemd configure
@@ -155,3 +188,137 @@ uninstall:
 
 $(BIN_DIR) $(PLUGIN_DIR) $(CA_DIR) $(SYSTEMD_DIR):
 	@mkdir -p $@
+
+# ----------------------------------------------------------------------------
+# System-wide install (sudo). Sets up a shared CCR daemon owned by a
+# dedicated `code-router` system user and started at boot. Per-user state
+# (~/.claude-code-router etc.) is untouched.
+# ----------------------------------------------------------------------------
+
+install-system: check-prereqs-system install-system-user install-system-dirs \
+                install-system-router install-system-bin install-system-plugin \
+                install-system-systemd configure-system
+	@echo
+	@if test -r $(SYS_CFG); then \
+		echo "code-router system install complete."; \
+		echo "  Daemon: systemctl status code-router.service"; \
+		echo "  Timer:  systemctl status code-router-refresh.timer"; \
+	else \
+		echo "code-router system install complete (config pending)."; \
+		echo ""; \
+		echo "  Next: populate $(SYS_CFG) with your provider entries."; \
+		echo "        sudo cp $(CURDIR)/config.example.json $(SYS_CFG)"; \
+		echo "        sudo chown root:$(SYS_USER) $(SYS_CFG)"; \
+		echo "        sudo chmod 0640 $(SYS_CFG)"; \
+		echo "        sudo \$$EDITOR $(SYS_CFG)"; \
+		echo ""; \
+		echo "        Then: sudo make configure-system"; \
+	fi
+
+check-prereqs-system:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "ERROR: install-system requires root (try: sudo make install-system)"; exit 1; \
+	fi
+	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed"; exit 1; }
+	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
+	@command -v node    >/dev/null || { echo "ERROR: node not installed (try: apt install nodejs npm)"; exit 1; }
+	@command -v npm     >/dev/null || { echo "ERROR: npm not installed (try: apt install nodejs npm)"; exit 1; }
+
+install-system-user:
+	@if ! getent passwd $(SYS_USER) >/dev/null; then \
+		echo "Creating system user '$(SYS_USER)' (home: $(SYS_STATE_DIR))..."; \
+		useradd --system --home-dir $(SYS_STATE_DIR) --shell /usr/sbin/nologin \
+			--comment "code-router daemon" $(SYS_USER); \
+	else \
+		echo "System user '$(SYS_USER)' already exists."; \
+	fi
+
+install-system-dirs:
+	@install -d -m 0755 -o root -g root              $(SYS_BIN_DIR)
+	@install -d -m 0755 -o root -g root              $(SYS_SHARE_DIR)
+	@install -d -m 0755 -o root -g root              $(SYS_PLUGIN_DIR)
+	@install -d -m 0750 -o root -g $(SYS_USER)       $(SYS_CFG_DIR)
+	@install -d -m 0750 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)
+	@install -d -m 0750 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)/.claude-code-router
+
+install-system-bin:
+	@install -m 0755 bin/icode                     $(SYS_BIN_DIR)/icode
+	@install -m 0755 bin/code-router-refresh-token $(SYS_BIN_DIR)/code-router-refresh-token
+
+install-system-plugin:
+	@install -m 0644 plugins/strip-reasoning.js $(SYS_PLUGIN_DIR)/strip-reasoning.js
+	@install -m 0644 plugins/inject-token.js    $(SYS_PLUGIN_DIR)/inject-token.js
+
+install-system-router:
+	@if ! command -v pnpm >/dev/null 2>&1; then \
+		echo "Installing pnpm globally (required to build the vendored router)..."; \
+		npm i -g pnpm@9 >/dev/null; \
+	fi
+	@echo "Building vendored claude-code-router from $(ROUTER_SRC)..."
+	@cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null
+	@echo "Installing globally (system Node)..."
+	@npm i -g $(ROUTER_SRC) >/dev/null
+	@echo "claude-code-router installed system-wide."
+
+install-system-ca:
+	@HOSTS=$$(python3 -c "import json,urllib.parse,sys;cfg=json.load(open('$(SYS_CFG)'));print('\n'.join(sorted({urllib.parse.urlparse(p['base_url']).hostname for p in cfg['providers']})))"); \
+	test -n "$$HOSTS" || { echo "ERROR: no provider base_urls found in $(SYS_CFG)"; exit 1; }; \
+	: > $(SYS_CA_FILE); \
+	for HOST in $$HOSTS; do \
+		echo "Fetching CA chain from $$HOST..."; \
+		echo | openssl s_client -connect $$HOST:443 -showcerts 2>/dev/null | \
+			awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' \
+			>> $(SYS_CA_FILE); \
+	done; \
+	chmod 0644 $(SYS_CA_FILE); \
+	test -s $(SYS_CA_FILE) || { echo "ERROR: CA fetch failed"; exit 1; }; \
+	echo "Wrote $(SYS_CA_FILE) ($$(grep -c BEGIN $(SYS_CA_FILE)) cert(s) from $$(echo $$HOSTS | wc -w) host(s))"
+
+install-system-systemd:
+	@install -m 0644 systemd/system/code-router.service         $(SYS_SYSTEMD_DIR)/code-router.service
+	@install -m 0644 systemd/system/code-router-refresh.service $(SYS_SYSTEMD_DIR)/code-router-refresh.service
+	@install -m 0644 systemd/system/code-router-refresh.timer   $(SYS_SYSTEMD_DIR)/code-router-refresh.timer
+	@systemctl daemon-reload
+	@systemctl enable --now code-router-refresh.timer
+	@systemctl enable code-router.service
+	@echo "System units installed and enabled."
+
+# Config-dependent: needs $(SYS_CFG) populated. Fetches the corporate CA
+# chain into $(SYS_CA_FILE), mints the initial token, and (re)starts the
+# daemon so it picks up the populated config.
+configure-system:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "ERROR: configure-system requires root (try: sudo make configure-system)"; exit 1; \
+	fi
+	@if test -r $(SYS_CFG); then \
+		$(MAKE) install-system-ca; \
+		systemctl start code-router-refresh.service; \
+		systemctl restart code-router.service; \
+		echo "Daemon restarted with active provider; check 'systemctl status code-router'."; \
+	else \
+		echo "configure-system: $(SYS_CFG) not present yet -- skipping CA fetch + token mint."; \
+	fi
+
+uninstall-system:
+	@if [ "$$(id -u)" != "0" ]; then \
+		echo "ERROR: uninstall-system requires root (try: sudo make uninstall-system)"; exit 1; \
+	fi
+	-systemctl disable --now code-router.service code-router-refresh.timer 2>/dev/null
+	-rm -f $(SYS_SYSTEMD_DIR)/code-router.service \
+	       $(SYS_SYSTEMD_DIR)/code-router-refresh.service \
+	       $(SYS_SYSTEMD_DIR)/code-router-refresh.timer
+	-systemctl daemon-reload
+	-rm -f $(SYS_BIN_DIR)/icode $(SYS_BIN_DIR)/code-router-refresh-token
+	-rm -rf $(SYS_PLUGIN_DIR)
+	-rm -f $(SYS_CA_FILE)
+	-rmdir --ignore-fail-on-non-empty $(SYS_SHARE_DIR) 2>/dev/null
+	@echo
+	@echo "System install removed. The following were left in place:"
+	@echo "  - $(SYS_CFG_DIR)/  (your provider credentials)"
+	@echo "  - $(SYS_STATE_DIR)/ (token file, active-provider, daemon's CCR config)"
+	@echo "  - $(SYS_USER) system user"
+	@echo "  - npm-global @musistudio/claude-code-router"
+	@echo "Remove manually if desired:"
+	@echo "  sudo rm -rf $(SYS_CFG_DIR) $(SYS_STATE_DIR)"
+	@echo "  sudo userdel $(SYS_USER)"
+	@echo "  sudo npm uninstall -g @musistudio/claude-code-router"

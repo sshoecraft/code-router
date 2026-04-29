@@ -1,0 +1,46 @@
+[Unit]
+Description=claude-code-router daemon (icode shared-host)
+Documentation=https://github.com/sshoecraft/code-router
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=code-router
+Group=code-router
+WorkingDirectory=/var/lib/code-router
+
+# CCR derives all its paths from $HOME/.claude-code-router. Forcing HOME here
+# keeps state under /var/lib/code-router/.claude-code-router/ rather than
+# wherever a calling shell might pass through.
+Environment=HOME=/var/lib/code-router
+
+# Trust the corporate CA bundle when reaching the upstream gateway.
+Environment=NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem
+
+# Patched Anthropic transformer reads this path per request so token
+# rotation is invisible to in-flight sessions.
+Environment=ANTHROPIC_TOKEN_FILE=/var/lib/code-router/.claude-code-router/token.txt
+
+ExecStart=/usr/local/bin/ccr start
+Restart=always
+RestartSec=2
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/code-router
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
