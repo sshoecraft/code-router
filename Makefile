@@ -17,7 +17,7 @@ CCR_DIR       ?= $(PREFIX)/.claude-code-router
 PLUGIN_DIR    ?= $(CCR_DIR)/plugins
 CA_DIR        ?= $(PREFIX)/.local/share/ca-certs
 NVM_DIR       ?= $(PREFIX)/.nvm
-ICODE_CFG     ?= $(PREFIX)/.config/icode/config.toml
+ICODE_CFG     ?= $(PREFIX)/.config/icode/config.json
 
 NODE_VERSION  ?= 22
 NVM_VERSION   ?= v0.40.3
@@ -34,11 +34,9 @@ install: check-prereqs install-node install-router install-ca install-bin \
 	@echo "  Status: make status"
 
 check-prereqs:
-	@command -v jq >/dev/null      || { echo "ERROR: jq not installed (apt-get install jq)"; exit 1; }
-	@command -v yq >/dev/null      || { echo "ERROR: yq not installed (https://github.com/mikefarah/yq -- the Go variant, supports TOML)"; exit 1; }
-	@command -v curl >/dev/null    || { echo "ERROR: curl not installed"; exit 1; }
+	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed (apt-get install python3)"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
-	@test -r $(ICODE_CFG)          || { echo "ERROR: $(ICODE_CFG) not found -- create it with [[providers]] entries (see README)"; exit 1; }
+	@test -r $(ICODE_CFG)          || { echo "ERROR: $(ICODE_CFG) not found -- create it with a 'providers' array (see README)"; exit 1; }
 
 install-node:
 	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
@@ -76,7 +74,7 @@ install-plugin: | $(PLUGIN_DIR)
 	install -m 0644 plugins/inject-token.js    $(PLUGIN_DIR)/inject-token.js
 
 install-ca: | $(CA_DIR)
-	@HOSTS=$$(yq -p toml -o json $(ICODE_CFG) | jq -r '.providers[].base_url' | awk -F/ '{print $$3}' | sort -u); \
+	@HOSTS=$$(python3 -c "import json,urllib.parse,sys;cfg=json.load(open('$(ICODE_CFG)'));print('\n'.join(sorted({urllib.parse.urlparse(p['base_url']).hostname for p in cfg['providers']})))"); \
 	test -n "$$HOSTS" || { echo "ERROR: no provider base_urls found in $(ICODE_CFG)"; exit 1; }; \
 	: > $(CA_DIR)/code-router-ca.pem; \
 	for HOST in $$HOSTS; do \

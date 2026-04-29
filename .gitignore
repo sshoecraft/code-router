@@ -1,18 +1,1 @@
-# Build artifacts in the vendored router
-router/node_modules/
-router/**/node_modules/
-router/dist/
-router/**/dist/
-router/**/tsconfig.tsbuildinfo
-router/docs/build/
-router/docs/.docusaurus/
-
-# Editor / OS
-.vscode/
-.idea/
-.DS_Store
-
-# Runtime
-*.log
-.env
-.env.*
+bin/__pycache__/

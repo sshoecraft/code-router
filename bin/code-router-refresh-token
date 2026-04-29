@@ -1,257 +1,330 @@
-#!/usr/bin/env bash
-# code-router-refresh-token -- mint a fresh OAuth bearer token for the
-# active provider and atomically write it to ~/.claude-code-router/token.txt.
-#
-# Two provider flavors are supported:
-#
-#   type = "openai"     OpenAI-compatible chat-completions gateway. Routed
-#                       through CCR; the inject-token plugin reads token.txt
-#                       per request and rewrites the Authorization header.
-#
-#   type = "anthropic"  Anthropic-native Messages API gateway. icode bypasses
-#                       CCR for this flavor and execs `claude` directly with
-#                       ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN exported.
-#
-# Either way, this script writes the active provider's bearer token to
-# ~/.claude-code-router/token.txt. The active provider's name lives in
-# ~/.claude-code-router/active-provider so the timer-driven no-arg refresh
-# preserves the user's --provider choice.
-#
-# Usage:
-#   code-router-refresh-token                  # refresh active provider
-#   code-router-refresh-token --provider NAME  # switch active provider + refresh
-#   code-router-refresh-token --list           # list configured providers
-#
-# Active provider selection (in priority order):
-#   1. --provider NAME flag
-#   2. ~/.claude-code-router/active-provider file
-#   3. name parsed from Router.default in CCR config (legacy fallback)
-#   4. first provider in the icode config
-#
-# Source-of-truth credentials live in ~/.config/icode/config.toml. Override
-# with ICODE_CFG=/path/to/config.toml in the environment.
+#!/usr/bin/env python3
+"""code-router-refresh-token -- mint a fresh OAuth bearer token for the
+active provider and atomically write it to ~/.claude-code-router/token.txt.
 
-set -euo pipefail
+Two provider flavors are supported:
 
-ICODE_CFG="${ICODE_CFG:-$HOME/.config/icode/config.toml}"
-CCR_DIR="$HOME/.claude-code-router"
-CCR_CFG="$CCR_DIR/config.json"
-TOKEN_FILE="$CCR_DIR/token.txt"
-ACTIVE_FILE="$CCR_DIR/active-provider"
-CA_FILE="$HOME/.local/share/ca-certs/code-router-ca.pem"
-PLUGIN_DIR="$CCR_DIR/plugins"
+  type = "openai"     OpenAI-compatible chat-completions gateway. Routed
+                      through CCR; the inject-token plugin reads token.txt
+                      per request and rewrites the Authorization header.
 
-command -v yq >/dev/null || {
-  echo "code-router-refresh-token: yq required (https://github.com/mikefarah/yq)" >&2
-  exit 1
-}
+  type = "anthropic"  Anthropic-native Messages API gateway. Routed through
+                      CCR using the patched Anthropic transformer, which
+                      reads token.txt per request (gated on
+                      ANTHROPIC_TOKEN_FILE) and strips/clamps body fields
+                      the gateway's older API rejects.
 
-usage() {
-  sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
-  exit "${1:-2}"
-}
+Either way, this script writes the active provider's bearer token to
+~/.claude-code-router/token.txt. The active provider's name lives in
+~/.claude-code-router/active-provider so the timer-driven no-arg refresh
+preserves the user's --provider choice.
 
-REQUESTED_PROVIDER=""
-LIST_ONLY=0
-while (( $# )); do
-  case "$1" in
-    --provider) REQUESTED_PROVIDER="${2:-}"; shift 2 ;;
-    --provider=*) REQUESTED_PROVIDER="${1#*=}"; shift ;;
-    --list) LIST_ONLY=1; shift ;;
-    -h|--help) usage 0 ;;
-    *) echo "code-router-refresh-token: unknown arg: $1" >&2; usage ;;
-  esac
-done
+Usage:
+  code-router-refresh-token                  refresh active provider
+  code-router-refresh-token --provider NAME  switch active provider + refresh
+  code-router-refresh-token --list           list configured providers
 
-if [[ ! -r "$ICODE_CFG" ]]; then
-  echo "code-router-refresh-token: $ICODE_CFG not readable" >&2
-  echo "  create it with one or more [[providers]] entries; see README for schema" >&2
-  exit 1
-fi
+Active provider selection (in priority order):
+  1. --provider NAME flag
+  2. ~/.claude-code-router/active-provider file
+  3. name parsed from Router.default in the existing CCR config
+  4. first provider in the icode config
 
-# Convert TOML to JSON once; downstream jq pipelines reuse this string.
-CFG_JSON="$(yq -p toml -o json "$ICODE_CFG")"
+Source-of-truth credentials live in ~/.config/icode/config.json. Override
+with ICODE_CFG=/path/to/config.json in the environment. The schema is:
 
-if ! jq -e '.providers | length > 0 and all(.name != null and .name != "")' <<<"$CFG_JSON" >/dev/null; then
-  echo "code-router-refresh-token: $ICODE_CFG must define [[providers]] entries each with a 'name'" >&2
-  exit 1
-fi
+  {
+    "providers": [
+      {
+        "name":            "azprod",
+        "type":            "openai",         // or "anthropic"; default "openai"
+        "client_id":       "...",
+        "client_secret":   "...",
+        "token_url":       "https://.../oauth2/.../v1/token",
+        "token_scope":     "...",
+        "base_url":        "https://gateway.example.com/...",
+        "deployment_name": "...",            // openai only
+        "api_version":     "2024-06-01",     // openai only
+        "model":           "..."
+      }
+    ]
+  }
 
-# Validate each provider's type is one of the supported flavors.
-if ! jq -e '.providers | all(((.type // "openai") == "openai") or ((.type // "openai") == "anthropic"))' <<<"$CFG_JSON" >/dev/null; then
-  bad="$(jq -r '.providers[] | select(((.type // "openai") != "openai") and ((.type // "openai") != "anthropic")) | "\(.name)=\(.type)"' <<<"$CFG_JSON")"
-  echo "code-router-refresh-token: unknown provider type(s): $bad" >&2
-  echo "  supported: openai (default), anthropic" >&2
-  exit 1
-fi
+This script is pure-stdlib Python 3; no external packages required.
+"""
 
-mapfile -t PROVIDER_NAMES < <(jq -r '.providers[].name' <<<"$CFG_JSON")
+import argparse
+import base64
+import json
+import os
+import ssl
+import sys
+import tempfile
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-if (( LIST_ONLY )); then
-  jq -r '.providers[] | "\(.name)\t\(.type // "openai")"' <<<"$CFG_JSON" | column -t
-  exit 0
-fi
+HOME = Path.home()
+ICODE_CFG = Path(os.environ.get("ICODE_CFG", HOME / ".config" / "icode" / "config.json"))
+CCR_DIR = HOME / ".claude-code-router"
+CCR_CFG = CCR_DIR / "config.json"
+TOKEN_FILE = CCR_DIR / "token.txt"
+ACTIVE_FILE = CCR_DIR / "active-provider"
+CA_FILE = HOME / ".local" / "share" / "ca-certs" / "code-router-ca.pem"
+PLUGIN_DIR = CCR_DIR / "plugins"
+SUPPORTED_TYPES = ("openai", "anthropic")
 
-# --- Resolve the active provider ---
-active_from_file() {
-  [[ -r "$ACTIVE_FILE" ]] || return 1
-  tr -d '[:space:]' <"$ACTIVE_FILE"
-}
 
-active_from_router_default() {
-  [[ -r "$CCR_CFG" ]] || return 1
-  jq -r '.Router.default // ""' "$CCR_CFG" 2>/dev/null | awk -F, 'NF>0 && $1!="" {print $1; exit}'
-}
+def die(msg, code=1):
+    print(f"code-router-refresh-token: {msg}", file=sys.stderr)
+    sys.exit(code)
 
-ACTIVE=""
-if [[ -n "$REQUESTED_PROVIDER" ]]; then
-  ACTIVE="$REQUESTED_PROVIDER"
-elif a="$(active_from_file)" && [[ -n "$a" ]]; then
-  ACTIVE="$a"
-elif a="$(active_from_router_default)" && [[ -n "$a" ]]; then
-  ACTIVE="$a"
-else
-  ACTIVE="${PROVIDER_NAMES[0]}"
-fi
 
-if ! printf '%s\n' "${PROVIDER_NAMES[@]}" | grep -Fxq "$ACTIVE"; then
-  echo "code-router-refresh-token: provider '$ACTIVE' not found in $ICODE_CFG" >&2
-  echo "  available: ${PROVIDER_NAMES[*]}" >&2
-  exit 1
-fi
+def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
+    """Write content to path via tempfile + rename so readers never see a
+    half-written file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
-# --- Read fields for the active provider ---
-read_field() {
-  jq -r --arg name "$ACTIVE" --arg f "$1" \
-    '.providers[] | select(.name == $name) | .[$f] // ""' <<<"$CFG_JSON"
-}
 
-TYPE="$(read_field type)"
-[[ -n "$TYPE" ]] || TYPE="openai"
+def load_config() -> list:
+    if not ICODE_CFG.is_file():
+        die(
+            f"{ICODE_CFG} not readable\n"
+            "  create it with one or more 'providers' entries; see README for schema"
+        )
+    try:
+        with open(ICODE_CFG) as f:
+            cfg = json.load(f)
+    except json.JSONDecodeError as e:
+        die(f"{ICODE_CFG}: invalid JSON: {e}")
 
-CLIENT_ID="$(read_field client_id)"
-CLIENT_SECRET="$(read_field client_secret)"
-TOKEN_URL="$(read_field token_url)"
-TOKEN_SCOPE="$(read_field token_scope)"
-BASE_URL="$(read_field base_url)"
-DEPLOYMENT="$(read_field deployment_name)"
-API_VERSION="$(read_field api_version)"
-MODEL="$(read_field model)"
+    providers = cfg.get("providers")
+    if not isinstance(providers, list) or not providers:
+        die(f"{ICODE_CFG} must define a non-empty 'providers' array")
 
-required_for_type() {
-  case "$1" in
-    openai)    echo "CLIENT_ID CLIENT_SECRET TOKEN_URL BASE_URL DEPLOYMENT API_VERSION MODEL" ;;
-    anthropic) echo "CLIENT_ID CLIENT_SECRET TOKEN_URL BASE_URL MODEL" ;;
-  esac
-}
-for var in $(required_for_type "$TYPE"); do
-  if [[ -z "${!var}" ]]; then
-    echo "code-router-refresh-token: provider '$ACTIVE' (type=$TYPE) is missing required field: $var" >&2
-    exit 1
-  fi
-done
+    for p in providers:
+        if not isinstance(p, dict) or not p.get("name"):
+            die(f"{ICODE_CFG}: each provider entry must be an object with a 'name'")
+        t = p.get("type", "openai")
+        if t not in SUPPORTED_TYPES:
+            die(
+                f"{ICODE_CFG}: provider '{p['name']}' has unknown type '{t}' "
+                f"(supported: {', '.join(SUPPORTED_TYPES)})"
+            )
+    return providers
 
-# --- Mint a fresh OAuth bearer token for the active provider ---
-CURL_OPTS=(-sSf -X POST "$TOKEN_URL"
-  -u "$CLIENT_ID:$CLIENT_SECRET"
-  -d "grant_type=client_credentials&scope=$TOKEN_SCOPE")
-if [[ -r "$CA_FILE" ]]; then
-  CURL_OPTS+=(--cacert "$CA_FILE")
-else
-  CURL_OPTS+=(-k)
-fi
 
-TOKEN_JSON="$(curl "${CURL_OPTS[@]}")"
-ACCESS_TOKEN="$(jq -r '.access_token' <<<"$TOKEN_JSON")"
-EXPIRES_IN="$(jq -r '.expires_in // "?"' <<<"$TOKEN_JSON")"
-if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
-  echo "code-router-refresh-token: token mint failed for provider '$ACTIVE'" >&2
-  jq . <<<"$TOKEN_JSON" >&2
-  exit 1
-fi
+def resolve_active(providers: list, requested: str | None) -> str:
+    names = [p["name"] for p in providers]
+    if requested:
+        active = requested
+    else:
+        active = ""
+        try:
+            active = ACTIVE_FILE.read_text().strip()
+        except FileNotFoundError:
+            pass
+        if not active and CCR_CFG.is_file():
+            try:
+                with open(CCR_CFG) as f:
+                    rd = (json.load(f).get("Router") or {}).get("default", "")
+                active = rd.split(",", 1)[0] if rd else ""
+            except json.JSONDecodeError:
+                pass
+        if not active:
+            active = names[0]
 
-# --- Atomically publish the token + active-provider name ---
-mkdir -p "$CCR_DIR"
-umask 077
-TMP="$(mktemp "$CCR_DIR/.token.XXXXXX")"
-printf '%s\n' "$ACCESS_TOKEN" >"$TMP"
-chmod 600 "$TMP"
-mv -f "$TMP" "$TOKEN_FILE"
+    if active not in names:
+        die(
+            f"provider '{active}' not found in {ICODE_CFG}\n"
+            f"  available: {' '.join(names)}"
+        )
+    return active
 
-TMP="$(mktemp "$CCR_DIR/.active.XXXXXX")"
-printf '%s\n' "$ACTIVE" >"$TMP"
-chmod 600 "$TMP"
-mv -f "$TMP" "$ACTIVE_FILE"
 
-# --- Build CCR's Providers[] from ALL configured providers.
-#     openai providers use the openai chain + inject-token for auth.
-#     anthropic providers use the (patched) "Anthropic" passthrough; the
-#     CCR daemon reads ANTHROPIC_TOKEN_FILE on each request.
-PROVIDERS_JSON="$(jq \
-  '[ .providers[] | (.type // "openai") as $t |
-     if $t == "openai" then {
-       name: .name,
-       api_base_url: ((.base_url) + "/openai/deployments/" + .deployment_name +
-                      "/chat/completions?api-version=" + .api_version),
-       api_key: "PLACEHOLDER_OVERRIDDEN_BY_INJECT_TOKEN",
-       models: [.model],
-       transformer: { use: ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"] }
-     } elif $t == "anthropic" then {
-       name: .name,
-       api_base_url: ((.base_url) + "/v1/messages"),
-       api_key: "PLACEHOLDER_OVERRIDDEN_BY_TOKEN_FILE",
-       models: [.model],
-       transformer: { use: ["Anthropic"] }
-     } else empty end
-   ]' <<<"$CFG_JSON")"
+def required_fields(p_type: str) -> set:
+    base = {"client_id", "client_secret", "token_url", "base_url", "model"}
+    if p_type == "openai":
+        return base | {"deployment_name", "api_version"}
+    return base
 
-# Router.default points at the active provider, regardless of type.
-ROUTER_DEFAULT="$(jq -r --arg n "$ACTIVE" '.providers[] | select(.name == $n) | (.name + "," + .model)' <<<"$CFG_JSON")"
 
-PLUGIN_STRIP="$PLUGIN_DIR/strip-reasoning.js"
-PLUGIN_INJECT="$PLUGIN_DIR/inject-token.js"
+def mint_token(p: dict) -> tuple[str, object]:
+    """Mint a fresh OAuth client_credentials bearer token. Mirrors
+    `curl -u id:secret -d grant_type=...&scope=...` with the corporate CA
+    bundle when available."""
+    body = urllib.parse.urlencode(
+        {"grant_type": "client_credentials", "scope": p.get("token_scope", "")}
+    ).encode()
 
-need_bootstrap=0
-if [[ ! -r "$CCR_CFG" ]]; then
-  need_bootstrap=1
-elif ! grep -q "inject-token" "$CCR_CFG" 2>/dev/null; then
-  need_bootstrap=1
-fi
+    creds = f"{p['client_id']}:{p['client_secret']}".encode()
+    headers = {
+        "Authorization": "Basic " + base64.b64encode(creds).decode(),
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    req = urllib.request.Request(p["token_url"], data=body, headers=headers, method="POST")
 
-if (( need_bootstrap )); then
-  jq -n \
-    --argjson providers "$PROVIDERS_JSON" \
-    --arg router_default "$ROUTER_DEFAULT" \
-    --arg plugin_strip "$PLUGIN_STRIP" \
-    --arg plugin_inject "$PLUGIN_INJECT" \
-    '{
-      LOG: false,
-      API_TIMEOUT_MS: 600000,
-      transformers: [
-        { path: $plugin_strip },
-        { path: $plugin_inject }
-      ],
-      Providers: $providers,
-      Router: { default: $router_default }
-    }' >"$CCR_CFG"
-  chmod 600 "$CCR_CFG"
-  echo "code-router: wrote config -> $CCR_CFG (active: $ACTIVE, type: $TYPE)"
-else
-  # In-place update: refresh Providers[] always; refresh Router.default
-  # only when the user explicitly switched providers this run.
-  TMP_CFG="$(mktemp "$CCR_DIR/.config.XXXXXX")"
-  if [[ -n "$REQUESTED_PROVIDER" ]]; then
-    jq --argjson providers "$PROVIDERS_JSON" \
-       --arg router_default "$ROUTER_DEFAULT" \
-       '.Providers = $providers | .Router.default = $router_default' \
-       "$CCR_CFG" >"$TMP_CFG"
-  else
-    jq --argjson providers "$PROVIDERS_JSON" \
-       '.Providers = $providers' \
-       "$CCR_CFG" >"$TMP_CFG"
-  fi
-  chmod 600 "$TMP_CFG"
-  mv -f "$TMP_CFG" "$CCR_CFG"
-fi
+    # Use system CAs (Okta and other public TLDs) and ALSO trust the
+    # corporate bundle (gateway hosts behind the McKesson root CA). This
+    # mirrors curl's `--cacert FILE`, which keeps the system CApath
+    # alongside the supplied file, while Python's `cafile=` argument would
+    # replace system CAs entirely.
+    ctx = ssl.create_default_context()
+    if CA_FILE.is_file():
+        ctx.load_verify_locations(cafile=str(CA_FILE))
 
-echo "code-router: token refreshed for '$ACTIVE' (type: $TYPE, expires in ${EXPIRES_IN}s)"
+    try:
+        with urllib.request.urlopen(req, context=ctx, timeout=30) as resp:
+            payload = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        body = e.read().decode(errors="replace")
+        die(f"token mint failed for provider '{p['name']}': HTTP {e.code}\n{body}")
+    except urllib.error.URLError as e:
+        die(f"token mint failed for provider '{p['name']}': {e.reason}")
+
+    token = payload.get("access_token") if isinstance(payload, dict) else None
+    if not token:
+        die(
+            f"token mint failed for provider '{p['name']}':\n"
+            f"{json.dumps(payload, indent=2)}"
+        )
+    return token, payload.get("expires_in", "?")
+
+
+def build_ccr_provider(p: dict) -> dict:
+    """Build a CCR Providers[] entry for one icode provider."""
+    p_type = p.get("type", "openai")
+    if p_type == "openai":
+        url = (
+            p["base_url"]
+            + "/openai/deployments/"
+            + p["deployment_name"]
+            + "/chat/completions?api-version="
+            + p["api_version"]
+        )
+        return {
+            "name": p["name"],
+            "api_base_url": url,
+            "api_key": "PLACEHOLDER_OVERRIDDEN_BY_INJECT_TOKEN",
+            "models": [p["model"]],
+            "transformer": {
+                "use": ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"]
+            },
+        }
+    # anthropic
+    return {
+        "name": p["name"],
+        "api_base_url": p["base_url"] + "/v1/messages",
+        "api_key": "PLACEHOLDER_OVERRIDDEN_BY_TOKEN_FILE",
+        "models": [p["model"]],
+        "transformer": {"use": ["Anthropic"]},
+    }
+
+
+def update_ccr_config(
+    providers: list, active: str, active_model: str, requested: str | None
+) -> bool:
+    """Bootstrap or in-place-update the CCR config. Returns True if a fresh
+    bootstrap was written."""
+    new_providers = [build_ccr_provider(p) for p in providers]
+    router_default = f"{active},{active_model}"
+
+    plugin_strip = str(PLUGIN_DIR / "strip-reasoning.js")
+    plugin_inject = str(PLUGIN_DIR / "inject-token.js")
+
+    existing = None
+    if CCR_CFG.is_file():
+        try:
+            with open(CCR_CFG) as f:
+                existing = json.load(f)
+        except json.JSONDecodeError:
+            existing = None
+
+    # Treat missing or stale (no inject-token plugin) configs as needing bootstrap.
+    need_bootstrap = existing is None or "inject-token" not in json.dumps(
+        existing.get("transformers", [])
+    )
+
+    if need_bootstrap:
+        cfg = {
+            "LOG": False,
+            "API_TIMEOUT_MS": 600000,
+            "transformers": [
+                {"path": plugin_strip},
+                {"path": plugin_inject},
+            ],
+            "Providers": new_providers,
+            "Router": {"default": router_default},
+        }
+    else:
+        cfg = existing
+        cfg["Providers"] = new_providers
+        # Update Router.default only when the user explicitly switched, so
+        # the timer-driven no-arg refresh preserves the active selection.
+        if requested:
+            cfg.setdefault("Router", {})["default"] = router_default
+
+    atomic_write(CCR_CFG, json.dumps(cfg, indent=2) + "\n", mode=0o600)
+    return need_bootstrap
+
+
+def cmd_list(providers: list) -> None:
+    width = max(len(p["name"]) for p in providers)
+    for p in providers:
+        print(f"{p['name']:<{width}}  {p.get('type', 'openai')}")
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="code-router-refresh-token",
+        description="Mint OAuth tokens for icode providers; maintain CCR config.",
+    )
+    parser.add_argument("--provider", help="switch active provider, then refresh")
+    parser.add_argument(
+        "--list", action="store_true", help="list configured providers and exit"
+    )
+    args = parser.parse_args()
+
+    providers = load_config()
+
+    if args.list:
+        cmd_list(providers)
+        return
+
+    active = resolve_active(providers, args.provider)
+    p = next(x for x in providers if x["name"] == active)
+    p_type = p.get("type", "openai")
+
+    missing = sorted(k for k in required_fields(p_type) if not p.get(k))
+    if missing:
+        die(
+            f"provider '{active}' (type={p_type}) is missing required field(s): "
+            + ", ".join(missing)
+        )
+
+    token, expires_in = mint_token(p)
+
+    atomic_write(TOKEN_FILE, token + "\n", mode=0o600)
+    atomic_write(ACTIVE_FILE, active + "\n", mode=0o600)
+
+    bootstrapped = update_ccr_config(providers, active, p["model"], args.provider)
+    if bootstrapped:
+        print(f"code-router: wrote config -> {CCR_CFG} (active: {active}, type: {p_type})")
+    print(f"code-router: token refreshed for '{active}' (type: {p_type}, expires in {expires_in}s)")
+
+
+if __name__ == "__main__":
+    main()

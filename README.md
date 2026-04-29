@@ -39,31 +39,43 @@ daemon; nothing kills them.
 
 - Linux, or **Windows with WSL2** (shell scripts and systemd user timer
   are Linux-only; running under WSL2 is supported and tested)
-- `jq`, `yq` (the Go variant from <https://github.com/mikefarah/yq>,
-  needed for TOML parsing), `curl`, `openssl` on PATH
-- `~/.config/icode/config.toml` populated with one or more `[[providers]]`
-  entries (single source of truth for `name`, `client_id`,
-  `client_secret`, `token_url`, `token_scope`, `base_url`,
-  `deployment_name`, `api_version`, `model`). Each entry must have a
-  unique `name`. The first entry is the default active provider.
+- `python3` (any 3.x; only stdlib is used) and `openssl` on PATH
+- `~/.config/icode/config.json` populated with a `providers` array
+  (single source of truth for `name`, `type`, `client_id`,
+  `client_secret`, `token_url`, `token_scope`, `base_url`, `model`,
+  plus `deployment_name` + `api_version` for openai providers). Each
+  entry must have a unique `name`. The first entry is the default
+  active provider. `type` is `"openai"` (default) or `"anthropic"`.
 
   Example:
 
-  ```toml
-  [[providers]]
-  name             = "azprod"
-  client_id        = "..."
-  client_secret    = "..."
-  token_url        = "https://okta.example.com/oauth2/aus.../v1/token"
-  token_scope      = "..."
-  base_url         = "https://gateway.example.com"
-  deployment_name  = "gpt-51-prod"
-  api_version      = "2024-08-01-preview"
-  model            = "gpt-5.1"
-
-  [[providers]]
-  name             = "azuat"
-  # ... same shape, different values
+  ```json
+  {
+    "providers": [
+      {
+        "name":            "azprod",
+        "type":            "openai",
+        "client_id":       "...",
+        "client_secret":   "...",
+        "token_url":       "https://okta.example.com/oauth2/aus.../v1/token",
+        "token_scope":     "...",
+        "base_url":        "https://gateway.example.com",
+        "deployment_name": "gpt-51-prod",
+        "api_version":     "2024-06-01",
+        "model":           "gpt-51-prod"
+      },
+      {
+        "name":          "opus",
+        "type":          "anthropic",
+        "client_id":     "...",
+        "client_secret": "...",
+        "token_url":     "https://okta.example.com/oauth2/aus.../v1/token",
+        "token_scope":   "...",
+        "base_url":      "https://gateway.example.com/anthropic",
+        "model":         "claude-opus-4-5-..."
+      }
+    ]
+  }
   ```
 
   File should be mode `0600` (it holds OAuth client secrets).
@@ -129,9 +141,9 @@ to remove them are printed).
   so missed runs catch up after a sleep/reboot.
 - **Restart blip:** during the ~1 second daemon restart, an in-flight
   request may fail. Claude Code retries.
-- **Switching providers.** List multiple `[[providers]]` blocks in
-  `~/.config/icode/config.toml` (each needs a unique `name`). The first
-  is the default.
+- **Switching providers.** Add multiple entries to the `providers` array
+  in `~/.config/icode/config.json` (each needs a unique `name`). The
+  first is the default.
   Switch with either:
   - `icode --provider NAME ...` -- consumed by icode, not forwarded
   - `code-router-refresh-token --provider NAME` -- then run `icode`
@@ -163,8 +175,8 @@ cd ~/src/code-router
 make install
 ```
 
-The target host needs `~/.config/icode/config.toml` populated first
-(or override the path with `ICODE_CFG=/some/other/config.toml make install`).
+The target host needs `~/.config/icode/config.json` populated first
+(or override the path with `ICODE_CFG=/some/other/config.json make install`).
 
 ## Why not just point Claude Code straight at the gateway?
 
