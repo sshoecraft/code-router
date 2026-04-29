@@ -1,0 +1,26 @@
+{
+  "providers": [
+    {
+      "name":            "azprod",
+      "type":            "openai",
+      "client_id":       "REPLACE_ME",
+      "client_secret":   "REPLACE_ME",
+      "token_url":       "https://your-okta-tenant.okta.com/oauth2/REPLACE_ME/v1/token",
+      "token_scope":     "REPLACE_ME",
+      "base_url":        "https://gateway.example.com/your/openai-proxy/path",
+      "deployment_name": "REPLACE_ME",
+      "api_version":     "2024-06-01",
+      "model":           "REPLACE_ME"
+    },
+    {
+      "name":          "opus",
+      "type":          "anthropic",
+      "client_id":     "REPLACE_ME",
+      "client_secret": "REPLACE_ME",
+      "token_url":     "https://your-okta-tenant.okta.com/oauth2/REPLACE_ME/v1/token",
+      "token_scope":   "REPLACE_ME",
+      "base_url":      "https://gateway.example.com/your/anthropic-proxy/path",
+      "model":         "REPLACE_ME"
+    }
+  ]
+}

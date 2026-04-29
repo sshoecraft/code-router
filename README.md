@@ -88,21 +88,39 @@ daemon; nothing kills them.
 ```bash
 git clone <this-repo> ~/src/code-router  # or scp
 cd ~/src/code-router
-make install
+make install                                       # config-independent setup
+
+# Now create your provider config (or edit if it already exists):
+mkdir -p ~/.config/icode
+cp config.example.json ~/.config/icode/config.json
+chmod 600 ~/.config/icode/config.json
+$EDITOR ~/.config/icode/config.json                # fill in the REPLACE_ME values
+
+make configure                                     # CA fetch + initial token mint
 ```
 
-The Makefile will:
+`make install` is split in two phases so the first phase doesn't
+require credentials yet:
+
+**Phase 1 (`make install`):** does everything that doesn't depend on
+your config —
 
 1. Install **nvm** + **Node 22 LTS** if missing (user-local, no root)
 2. Build the **vendored claude-code-router** in `router/` (patched fork --
    see `router/PATCHES.md`) and install it user-global via `npm i -g`
-3. Fetch the corporate CA chain from the gateway and store it at
-   `~/.local/share/ca-certs/code-router-ca.pem`
-4. Install `~/.local/bin/icode` and `~/.local/bin/code-router-refresh-token`
+3. Install `~/.local/bin/icode` and `~/.local/bin/code-router-refresh-token`
    (same dir Claude Code uses; on PATH by default on modern Linux)
-5. Install the `strip-reasoning` custom CCR transformer
-6. Install + enable `code-router.timer` (refresh every 30 min, on boot)
+4. Install the `strip-reasoning` and `inject-token` custom CCR transformers
+5. Install + enable `code-router.timer` (refresh every 30 min, on boot)
+
+**Phase 2 (`make configure`, once `~/.config/icode/config.json` is
+populated):**
+
+6. Fetch the corporate CA chain from each gateway and store it at
+   `~/.local/share/ca-certs/code-router-ca.pem`
 7. Mint the initial token and write `~/.claude-code-router/config.json`
+
+`make configure` is safe to re-run any time you add or edit a provider.
 
 After install:
 

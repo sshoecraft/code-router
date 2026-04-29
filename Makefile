@@ -24,19 +24,40 @@ NVM_VERSION   ?= v0.40.3
 ROUTER_SRC    := $(CURDIR)/router
 
 .PHONY: install uninstall status refresh check-prereqs install-node \
-        install-router install-bin install-plugin install-ca install-systemd
+        install-router install-bin install-plugin install-ca install-systemd \
+        configure
 
-install: check-prereqs install-node install-router install-ca install-bin \
-         install-plugin install-systemd refresh
+install: check-prereqs install-node install-router install-bin install-plugin \
+         install-systemd configure
 	@echo
-	@echo "code-router installed."
-	@echo "  Try: icode -p 'say OK'"
-	@echo "  Status: make status"
+	@if test -r $(ICODE_CFG); then \
+		echo "code-router installed."; \
+		echo "  Try: icode -p 'say OK'"; \
+		echo "  Status: make status"; \
+	else \
+		echo "code-router installed (config pending)."; \
+		echo ""; \
+		echo "  Next: create $(ICODE_CFG) with your provider entries."; \
+		echo "        A starter template is at $(CURDIR)/config.example.json"; \
+		echo ""; \
+		echo "        cp $(CURDIR)/config.example.json $(ICODE_CFG)"; \
+		echo "        chmod 600 $(ICODE_CFG)"; \
+		echo "        \$$EDITOR $(ICODE_CFG)"; \
+		echo ""; \
+		echo "        Then: make configure"; \
+	fi
 
 check-prereqs:
 	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed (apt-get install python3)"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
-	@test -r $(ICODE_CFG)          || { echo "ERROR: $(ICODE_CFG) not found -- create it with a 'providers' array (see README)"; exit 1; }
+
+# Config-dependent finishing steps. Safe to re-run after editing the config.
+configure:
+	@if test -r $(ICODE_CFG); then \
+		$(MAKE) install-ca refresh; \
+	else \
+		echo "configure: $(ICODE_CFG) not present yet -- skipping CA fetch + token mint."; \
+	fi
 
 install-node:
 	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
