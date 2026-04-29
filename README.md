@@ -79,9 +79,14 @@ daemon; nothing kills them.
   ```
 
   File should be mode `0600` (it holds OAuth client secrets).
-- `systemd` user instance (default on Linux desktops/servers; WSL2 needs
-  `systemd=true` in `/etc/wsl.conf` — enabled by default in recent
-  Windows 11 / WSL releases)
+- `systemd` user instance, *recommended* (default on Linux desktops; WSL2
+  needs `systemd=true` in `/etc/wsl.conf`, enabled by default in recent
+  Windows 11 / WSL releases). On headless servers you may also need
+  `sudo loginctl enable-linger $(whoami)` so the user systemd instance
+  runs without an interactive session. If the user systemd bus isn't
+  reachable at install time, the timer simply isn't enabled and you'll
+  need to run `make refresh` manually before each session (or any time
+  the OAuth token expires, ~1h).
 
 ## Install
 

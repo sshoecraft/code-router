@@ -108,10 +108,24 @@ install-ca: | $(CA_DIR)
 	echo "Wrote $(CA_DIR)/code-router-ca.pem ($$(grep -c BEGIN $(CA_DIR)/code-router-ca.pem) cert(s) from $$(echo $$HOSTS | wc -w) host(s))"
 
 install-systemd: | $(SYSTEMD_DIR)
-	install -m 0644 systemd/code-router.service $(SYSTEMD_DIR)/code-router.service
-	install -m 0644 systemd/code-router.timer   $(SYSTEMD_DIR)/code-router.timer
-	systemctl --user daemon-reload
-	systemctl --user enable --now code-router.timer
+	@install -m 0644 systemd/code-router.service $(SYSTEMD_DIR)/code-router.service
+	@install -m 0644 systemd/code-router.timer   $(SYSTEMD_DIR)/code-router.timer
+	@if systemctl --user daemon-reload 2>/dev/null; then \
+		systemctl --user enable --now code-router.timer; \
+		echo "Enabled code-router.timer (refreshes every 30 min)."; \
+	else \
+		echo ""; \
+		echo "WARNING: systemctl --user is not reachable on this machine."; \
+		echo "  Unit files installed to $(SYSTEMD_DIR), but the timer is NOT enabled."; \
+		echo "  Token refresh will need to be triggered manually with 'make refresh'"; \
+		echo "  until the user-systemd instance is available."; \
+		echo ""; \
+		echo "  Common cause: linger isn't enabled for this user. Fix with:"; \
+		echo "    sudo loginctl enable-linger \$$(whoami)"; \
+		echo "  Then log out and back in, and re-run:"; \
+		echo "    make install-systemd"; \
+		echo ""; \
+	fi
 
 refresh:
 	@$(BIN_DIR)/code-router-refresh-token
