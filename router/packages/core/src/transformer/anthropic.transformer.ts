@@ -26,13 +26,71 @@ export class AnthropicTransformer implements Transformer {
   }
 
   async auth(request: any, provider: LLMProvider): Promise<any> {
+    // code-router patch: when ANTHROPIC_TOKEN_FILE is set, read a freshly
+    // rotated bearer token from disk per request (paired with the user-side
+    // token-refresh timer). This lets the daemon stay up across rotations.
+    let apiKey = provider.apiKey;
+    let useBearer = this.useBearer;
+    const tokenFile = process.env.ANTHROPIC_TOKEN_FILE;
+    if (tokenFile) {
+      try {
+        // eslint-disable-next-line @typescript-eslint/no-var-requires
+        const fs = require("fs");
+        const t = fs.readFileSync(tokenFile, "utf8").trim();
+        if (t) {
+          apiKey = t;
+          useBearer = true;
+        }
+      } catch {
+        // Fall through to provider.apiKey; upstream will reject with 401,
+        // which is a clearer signal than silently sending a stale token.
+      }
+    }
+
+    // code-router patch: strip/clamp request fields the corporate Anthropic
+    // gateway's older API rejects. Gated on ANTHROPIC_TOKEN_FILE so
+    // anyone reusing this router against a real Anthropic upstream gets
+    // upstream behavior unchanged.
+    if (tokenFile && request && typeof request === "object") {
+      // context_management is a newer Claude Code beta the gateway's older
+      // API doesn't accept at all -- no equivalent shape to fall back to,
+      // so just drop it.
+      delete request.context_management;
+
+      // reasoning effort levels: clamp anything the gateway doesn't accept
+      // (e.g. "xhigh") down to "high" so the user's intent is preserved
+      // rather than dropped.
+      const supportedEfforts = new Set(["high", "medium", "low"]);
+      const clampEffort = (v: any): any =>
+        typeof v === "string" && !supportedEfforts.has(v) ? "high" : v;
+      if (typeof request.reasoning_effort === "string") {
+        request.reasoning_effort = clampEffort(request.reasoning_effort);
+      }
+      if (request.reasoning && typeof request.reasoning === "object") {
+        if (typeof request.reasoning.effort === "string") {
+          request.reasoning.effort = clampEffort(request.reasoning.effort);
+        }
+      }
+      if (request.output_config && typeof request.output_config === "object") {
+        if (typeof request.output_config.effort === "string") {
+          request.output_config.effort = clampEffort(request.output_config.effort);
+        }
+      }
+
+      // thinking: the gateway returns inconsistent errors across both the
+      // standard Anthropic shape `{ type, budget_tokens }` and the key-as-
+      // discriminator shape `{ enabled: { budget_tokens } }`, so just drop
+      // it for now. Revisit if/when the gateway's schema is documented.
+      delete request.thinking;
+    }
+
     const headers: Record<string, string | undefined> = {};
 
-    if (this.useBearer) {
-      headers["authorization"] = `Bearer ${provider.apiKey}`;
+    if (useBearer) {
+      headers["authorization"] = `Bearer ${apiKey}`;
       headers["x-api-key"] = undefined;
     } else {
-      headers["x-api-key"] = provider.apiKey;
+      headers["x-api-key"] = apiKey;
       headers["authorization"] = undefined;
     }
 

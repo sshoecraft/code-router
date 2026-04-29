@@ -9,6 +9,11 @@ Type=oneshot
 # this env, so the corporate CA bundle MUST be exported here -- otherwise
 # the freshly spawned daemon cannot validate TLS to the upstream gateway.
 Environment=NODE_EXTRA_CA_CERTS=%h/.local/share/ca-certs/code-router-ca.pem
+# Tells the patched Anthropic transformer where to read the freshly rotated
+# bearer token from on each request. The CCR daemon inherits this env when
+# spawned by `ccr restart`, so anthropic-typed providers get token rotation
+# without daemon restarts.
+Environment=ANTHROPIC_TOKEN_FILE=%h/.claude-code-router/token.txt
 # systemd's default user PATH omits ~/.local/bin, where yq lives (and where
 # this script itself lives). Prepend it so the refresh script's own helper
 # lookups (yq, jq, curl, etc.) all resolve.

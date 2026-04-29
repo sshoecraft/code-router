@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # icode -- run Claude Code through claude-code-router (CCR), routing
-# requests to the OpenAI-compatible gateway(s) configured in
-# ~/.config/icode/config.toml.
+# requests to the active provider configured in ~/.config/icode/config.toml.
 #
-# Token refresh and config materialization are handled by the
-# code-router.timer systemd user unit; this script just sources nvm
-# so Node 22 is on PATH and execs `ccr code`.
+# Both openai and anthropic provider types route through CCR. The vendored
+# Anthropic transformer has been patched to read the bearer token from
+# ANTHROPIC_TOKEN_FILE per request, so token rotation is invisible to
+# in-flight sessions for both flavors.
 #
-# Optional: pass --provider NAME (anywhere in args) to switch the active
-# provider for this and subsequent sessions. The flag is consumed here and
-# NOT forwarded to claude-code.
+# Flags consumed here (NOT forwarded to claude-code):
+#   --provider NAME   switch the active provider for this and subsequent runs
+#   --list            list configured providers and exit
+#   --safe            keep claude-code's permission prompts (default: skip)
 
 set -euo pipefail
 
@@ -17,7 +18,6 @@ NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 CCR_CFG="$HOME/.claude-code-router/config.json"
 REFRESH_BIN="$HOME/.local/bin/code-router-refresh-token"
 
-# Intercept icode-specific flags before forwarding the rest to ccr code.
 PROVIDER=""
 SAFE_MODE=0
 FORWARD_ARGS=()
@@ -41,8 +41,7 @@ if [[ ! -r "$CCR_CFG" || -n "$PROVIDER" ]]; then
       "$REFRESH_BIN"
     fi
   else
-    echo "icode: $REFRESH_BIN not found" >&2
-    echo "       run 'make install' from the code-router project" >&2
+    echo "icode: $REFRESH_BIN not found -- run 'make install'" >&2
     exit 1
   fi
 fi
@@ -62,13 +61,15 @@ if [[ -r "$CA_FILE" ]]; then
   export NODE_EXTRA_CA_CERTS="$CA_FILE"
 fi
 
+# Tell the patched CCR Anthropic transformer where to read the live bearer
+# token from. The daemon inherits this when spawned by `ccr code`.
+export ANTHROPIC_TOKEN_FILE="$HOME/.claude-code-router/token.txt"
+
 # Bump the Read tool's per-call token cap from the default 25k to 128k so
 # large MCP tool results (e.g. read_workpaper dumping a multi-sheet xlsx)
 # don't blow up the model's ingestion path. Caller can override.
 export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-128000}"
 
-# icode is an interactive launcher for ad-hoc local work; default to skipping
-# Claude Code's per-action permission prompts. Pass --safe to opt back in.
 SKIP_PERMS=()
 if (( ! SAFE_MODE )); then
   SKIP_PERMS=(--dangerously-skip-permissions)

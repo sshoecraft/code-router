@@ -83,7 +83,7 @@ The Makefile will:
 
 1. Install **nvm** + **Node 22 LTS** if missing (user-local, no root)
 2. Build the **vendored claude-code-router** in `router/` (patched fork --
-   see `router/RESTART-FIX.md`) and install it user-global via `npm i -g`
+   see `router/PATCHES.md`) and install it user-global via `npm i -g`
 3. Fetch the corporate CA chain from the gateway and store it at
    `~/.local/share/ca-certs/code-router-ca.pem`
 4. Install `~/.local/bin/icode` and `~/.local/bin/code-router-refresh-token`
@@ -175,7 +175,7 @@ transformer paper over two GPT-5-specific quirks some gateways reject.
 
 ## Why a vendored router?
 
-`router/` is a patched copy of `@musistudio/claude-code-router` with two
+`router/` is a patched copy of `@musistudio/claude-code-router` with three
 local fixes:
 
 1. **`restartService` race + silent failure** -- upstream sends SIGTERM
@@ -188,5 +188,11 @@ local fixes:
    `shell: true` with packed tokens, so any prompt containing shell
    metacharacters (`$`, backticks, semicolons) gets re-interpreted by
    `/bin/sh`. Multi-line markdown prompts blow up.
+3. **Anthropic transformer auth + body cleanup** -- gated on
+   `ANTHROPIC_TOKEN_FILE`, the transformer reads the live OAuth bearer
+   token from disk per request (so anthropic providers get token
+   rotation without a daemon restart) and strips/clamps body fields the
+   corporate gateway's older API rejects (`context_management`,
+   `thinking`, `output_config.effort: "xhigh"`).
 
-See `router/RESTART-FIX.md` for the full diagnosis of both.
+See `router/PATCHES.md` for the full diagnosis of all three patches.
