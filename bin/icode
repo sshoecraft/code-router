@@ -1,10 +1,15 @@
 #!/usr/bin/env bash
 # icode -- run Claude Code through claude-code-router (CCR), routing
-# requests to the OpenAI-compatible gateway configured in shepherd.
+# requests to the OpenAI-compatible gateway(s) configured in
+# ~/.config/icode/config.toml.
 #
 # Token refresh and config materialization are handled by the
 # code-router.timer systemd user unit; this script just sources nvm
 # so Node 22 is on PATH and execs `ccr code`.
+#
+# Optional: pass --provider NAME (anywhere in args) to switch the active
+# provider for this and subsequent sessions. The flag is consumed here and
+# NOT forwarded to claude-code.
 
 set -euo pipefail
 
@@ -12,12 +17,31 @@ NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
 CCR_CFG="$HOME/.claude-code-router/config.json"
 REFRESH_BIN="$HOME/.local/bin/code-router-refresh-token"
 
-# If config doesn't exist (fresh install or after uninstall), mint it now.
-if [[ ! -r "$CCR_CFG" ]]; then
+# Intercept icode-specific flags before forwarding the rest to ccr code.
+PROVIDER=""
+SAFE_MODE=0
+FORWARD_ARGS=()
+while (( $# )); do
+  case "$1" in
+    --provider) PROVIDER="${2:-}"; shift 2 ;;
+    --provider=*) PROVIDER="${1#*=}"; shift ;;
+    --list) exec "${REFRESH_BIN}" --list ;;
+    --safe) SAFE_MODE=1; shift ;;
+    *) FORWARD_ARGS+=("$1"); shift ;;
+  esac
+done
+
+# If config doesn't exist (fresh install) OR the user is switching providers,
+# run the refresh script first.
+if [[ ! -r "$CCR_CFG" || -n "$PROVIDER" ]]; then
   if [[ -x "$REFRESH_BIN" ]]; then
-    "$REFRESH_BIN"
+    if [[ -n "$PROVIDER" ]]; then
+      "$REFRESH_BIN" --provider "$PROVIDER"
+    else
+      "$REFRESH_BIN"
+    fi
   else
-    echo "icode: $CCR_CFG missing and $REFRESH_BIN not found" >&2
+    echo "icode: $REFRESH_BIN not found" >&2
     echo "       run 'make install' from the code-router project" >&2
     exit 1
   fi
@@ -43,4 +67,11 @@ fi
 # don't blow up the model's ingestion path. Caller can override.
 export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-128000}"
 
-exec ccr code "$@"
+# icode is an interactive launcher for ad-hoc local work; default to skipping
+# Claude Code's per-action permission prompts. Pass --safe to opt back in.
+SKIP_PERMS=()
+if (( ! SAFE_MODE )); then
+  SKIP_PERMS=(--dangerously-skip-permissions)
+fi
+
+exec ccr code ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}

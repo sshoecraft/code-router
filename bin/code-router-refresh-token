@@ -1,30 +1,107 @@
 #!/usr/bin/env bash
-# code-router-refresh-token -- mint a fresh OAuth bearer token from Okta and
-# atomically write it to ~/.claude-code-router/token.txt. The CCR daemon
-# reads this file per-request via the `inject-token` plugin, so token
-# rotation is invisible to in-flight sessions and the daemon does NOT need
-# to be restarted.
+# code-router-refresh-token -- mint a fresh OAuth bearer token for the
+# active provider from Okta and atomically write it to
+# ~/.claude-code-router/token.txt. The CCR daemon reads this file per-request
+# via the `inject-token` plugin, so token rotation is invisible to in-flight
+# sessions and the daemon does NOT need to be restarted.
 #
 # Also (first-run only) materializes the static CCR config that points the
-# daemon at the gateway and wires up our transformer chain.
+# daemon at every provider listed in ~/.config/icode/config.toml and wires
+# up the transformer chain.
 #
-# Source-of-truth credentials live in shepherd's config (single source).
+# Usage:
+#   code-router-refresh-token                  # refresh active provider
+#   code-router-refresh-token --provider NAME  # switch active provider + refresh
+#   code-router-refresh-token --list           # list configured providers
+#
+# Active provider selection (in priority order):
+#   1. --provider NAME flag
+#   2. name parsed from Router.default in the existing CCR config
+#   3. first provider in the icode config
+#
+# Source-of-truth credentials live in ~/.config/icode/config.toml. Override
+# with ICODE_CFG=/path/to/config.toml in the environment.
 
 set -euo pipefail
 
-SHEPHERD_CFG="${SHEPHERD_CFG:-$HOME/.config/shepherd/config.json}"
+ICODE_CFG="${ICODE_CFG:-$HOME/.config/icode/config.toml}"
 CCR_DIR="$HOME/.claude-code-router"
 CCR_CFG="$CCR_DIR/config.json"
 TOKEN_FILE="$CCR_DIR/token.txt"
 CA_FILE="$HOME/.local/share/ca-certs/code-router-ca.pem"
 PLUGIN_DIR="$CCR_DIR/plugins"
 
-if [[ ! -r "$SHEPHERD_CFG" ]]; then
-  echo "code-router-refresh-token: $SHEPHERD_CFG not readable" >&2
+command -v yq >/dev/null || {
+  echo "code-router-refresh-token: yq required (https://github.com/mikefarah/yq)" >&2
+  exit 1
+}
+
+usage() {
+  sed -n '/^# Usage:/,/^$/p' "$0" | sed 's/^# \{0,1\}//' >&2
+  exit "${1:-2}"
+}
+
+REQUESTED_PROVIDER=""
+LIST_ONLY=0
+while (( $# )); do
+  case "$1" in
+    --provider) REQUESTED_PROVIDER="${2:-}"; shift 2 ;;
+    --provider=*) REQUESTED_PROVIDER="${1#*=}"; shift ;;
+    --list) LIST_ONLY=1; shift ;;
+    -h|--help) usage 0 ;;
+    *) echo "code-router-refresh-token: unknown arg: $1" >&2; usage ;;
+  esac
+done
+
+if [[ ! -r "$ICODE_CFG" ]]; then
+  echo "code-router-refresh-token: $ICODE_CFG not readable" >&2
+  echo "  create it with one or more [[providers]] entries; see README for schema" >&2
   exit 1
 fi
 
-read_field() { jq -r --arg f "$1" '.providers[0][$f]' "$SHEPHERD_CFG"; }
+# Convert TOML to JSON once; downstream jq pipelines reuse this string.
+CFG_JSON="$(yq -p toml -o json "$ICODE_CFG")"
+
+# Validate every provider has a name; bail with a clear message if not.
+if ! jq -e '.providers | length > 0 and all(.name != null and .name != "")' <<<"$CFG_JSON" >/dev/null; then
+  echo "code-router-refresh-token: $ICODE_CFG must define [[providers]] entries each with a 'name'" >&2
+  exit 1
+fi
+
+mapfile -t PROVIDER_NAMES < <(jq -r '.providers[].name' <<<"$CFG_JSON")
+
+if (( LIST_ONLY )); then
+  for n in "${PROVIDER_NAMES[@]}"; do echo "$n"; done
+  exit 0
+fi
+
+# --- Resolve the active provider ---
+active_from_config() {
+  [[ -r "$CCR_CFG" ]] || return 1
+  jq -r '.Router.default // ""' "$CCR_CFG" 2>/dev/null | awk -F, 'NF>0 && $1!="" {print $1; exit}'
+}
+
+ACTIVE=""
+if [[ -n "$REQUESTED_PROVIDER" ]]; then
+  ACTIVE="$REQUESTED_PROVIDER"
+elif ACTIVE_FROM_CFG="$(active_from_config)" && [[ -n "$ACTIVE_FROM_CFG" ]]; then
+  ACTIVE="$ACTIVE_FROM_CFG"
+else
+  ACTIVE="${PROVIDER_NAMES[0]}"
+fi
+
+# Validate the chosen name exists in the icode config.
+if ! printf '%s\n' "${PROVIDER_NAMES[@]}" | grep -Fxq "$ACTIVE"; then
+  echo "code-router-refresh-token: provider '$ACTIVE' not found in $ICODE_CFG" >&2
+  echo "  available: ${PROVIDER_NAMES[*]}" >&2
+  exit 1
+fi
+
+# --- Read fields for the active provider ---
+read_field() {
+  jq -r --arg name "$ACTIVE" --arg f "$1" \
+    '.providers[] | select(.name == $name) | .[$f] // ""' <<<"$CFG_JSON"
+}
 
 CLIENT_ID="$(read_field client_id)"
 CLIENT_SECRET="$(read_field client_secret)"
@@ -35,7 +112,14 @@ DEPLOYMENT="$(read_field deployment_name)"
 API_VERSION="$(read_field api_version)"
 MODEL="$(read_field model)"
 
-# --- Mint a fresh OAuth bearer token ---
+for var in CLIENT_ID CLIENT_SECRET TOKEN_URL BASE_URL DEPLOYMENT API_VERSION MODEL; do
+  if [[ -z "${!var}" ]]; then
+    echo "code-router-refresh-token: provider '$ACTIVE' is missing required field: $var" >&2
+    exit 1
+  fi
+done
+
+# --- Mint a fresh OAuth bearer token for the active provider ---
 CURL_OPTS=(-sSf -X POST "$TOKEN_URL"
   -u "$CLIENT_ID:$CLIENT_SECRET"
   -d "grant_type=client_credentials&scope=$TOKEN_SCOPE")
@@ -49,7 +133,7 @@ TOKEN_JSON="$(curl "${CURL_OPTS[@]}")"
 ACCESS_TOKEN="$(jq -r '.access_token' <<<"$TOKEN_JSON")"
 EXPIRES_IN="$(jq -r '.expires_in // "?"' <<<"$TOKEN_JSON")"
 if [[ -z "$ACCESS_TOKEN" || "$ACCESS_TOKEN" == "null" ]]; then
-  echo "code-router-refresh-token: token mint failed" >&2
+  echo "code-router-refresh-token: token mint failed for provider '$ACTIVE'" >&2
   jq . <<<"$TOKEN_JSON" >&2
   exit 1
 fi
@@ -63,10 +147,37 @@ printf '%s\n' "$ACCESS_TOKEN" >"$TMP"
 chmod 600 "$TMP"
 mv -f "$TMP" "$TOKEN_FILE"
 
-# --- First-run bootstrap: write the static CCR config if it doesn't exist
-#     (or if it's clearly stale -- doesn't reference the inject-token plugin).
-#     The api_key here is a placeholder; inject-token overrides per request.
-COMPLETIONS_URL="${BASE_URL}/openai/deployments/${DEPLOYMENT}/chat/completions?api-version=${API_VERSION}"
+# --- Build the Providers[] array from ALL configured providers, so /model
+#     switching works without re-running this script (the active provider
+#     still owns token.txt — switch with --provider to re-mint). ---
+build_providers_json() {
+  jq --arg plugin_strip "$PLUGIN_DIR/strip-reasoning.js" \
+     --arg plugin_inject "$PLUGIN_DIR/inject-token.js" \
+     '[ .providers[] | {
+        name: .name,
+        api_base_url: ((.base_url) + "/openai/deployments/" + .deployment_name +
+                       "/chat/completions?api-version=" + .api_version),
+        api_key: "PLACEHOLDER_OVERRIDDEN_BY_INJECT_TOKEN",
+        models: [.model],
+        transformer: { use: ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"] }
+      } ]' <<<"$CFG_JSON"
+}
+
+router_default_for() {
+  local name="$1"
+  jq -r --arg name "$name" '.providers[] | select(.name == $name) | (.name + "," + .model)' <<<"$CFG_JSON"
+}
+
+ROUTER_DEFAULT="$(router_default_for "$ACTIVE")"
+PROVIDERS_JSON="$(build_providers_json)"
+PLUGIN_STRIP="$PLUGIN_DIR/strip-reasoning.js"
+PLUGIN_INJECT="$PLUGIN_DIR/inject-token.js"
+
+# Bootstrap-or-update the CCR config:
+#   - If missing or stale (no inject-token plugin reference): full bootstrap.
+#   - Else: rewrite Providers[] (so newly-added entries appear) and
+#     Router.default (only if --provider was passed). Preserve LOG, API_TIMEOUT_MS,
+#     transformers paths, and any other top-level keys the user added.
 need_bootstrap=0
 if [[ ! -r "$CCR_CFG" ]]; then
   need_bootstrap=1
@@ -76,10 +187,10 @@ fi
 
 if (( need_bootstrap )); then
   jq -n \
-    --arg url "$COMPLETIONS_URL" \
-    --arg model "$MODEL" \
-    --arg plugin_strip "$PLUGIN_DIR/strip-reasoning.js" \
-    --arg plugin_inject "$PLUGIN_DIR/inject-token.js" \
+    --argjson providers "$PROVIDERS_JSON" \
+    --arg router_default "$ROUTER_DEFAULT" \
+    --arg plugin_strip "$PLUGIN_STRIP" \
+    --arg plugin_inject "$PLUGIN_INJECT" \
     '{
       LOG: false,
       API_TIMEOUT_MS: 600000,
@@ -87,17 +198,27 @@ if (( need_bootstrap )); then
         { path: $plugin_strip },
         { path: $plugin_inject }
       ],
-      Providers: [{
-        name: "azprod",
-        api_base_url: $url,
-        api_key: "PLACEHOLDER_OVERRIDDEN_BY_INJECT_TOKEN",
-        models: [$model],
-        transformer: { use: ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"] }
-      }],
-      Router: { default: ("azprod," + $model) }
+      Providers: $providers,
+      Router: { default: $router_default }
     }' >"$CCR_CFG"
   chmod 600 "$CCR_CFG"
-  echo "code-router: wrote static config -> $CCR_CFG"
+  echo "code-router: wrote config -> $CCR_CFG (active: $ACTIVE)"
+else
+  # In-place update: refresh Providers[] always, refresh Router.default only
+  # if the user explicitly chose a provider this run.
+  TMP_CFG="$(mktemp "$CCR_DIR/.config.XXXXXX")"
+  if [[ -n "$REQUESTED_PROVIDER" ]]; then
+    jq --argjson providers "$PROVIDERS_JSON" \
+       --arg router_default "$ROUTER_DEFAULT" \
+       '.Providers = $providers | .Router.default = $router_default' \
+       "$CCR_CFG" >"$TMP_CFG"
+  else
+    jq --argjson providers "$PROVIDERS_JSON" \
+       '.Providers = $providers' \
+       "$CCR_CFG" >"$TMP_CFG"
+  fi
+  chmod 600 "$TMP_CFG"
+  mv -f "$TMP_CFG" "$CCR_CFG"
 fi
 
-echo "code-router: token refreshed (expires in ${EXPIRES_IN}s)"
+echo "code-router: token refreshed for '$ACTIVE' (expires in ${EXPIRES_IN}s)"

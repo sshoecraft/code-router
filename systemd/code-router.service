@@ -9,6 +9,10 @@ Type=oneshot
 # this env, so the corporate CA bundle MUST be exported here -- otherwise
 # the freshly spawned daemon cannot validate TLS to the upstream gateway.
 Environment=NODE_EXTRA_CA_CERTS=%h/.local/share/ca-certs/code-router-ca.pem
+# systemd's default user PATH omits ~/.local/bin, where yq lives (and where
+# this script itself lives). Prepend it so the refresh script's own helper
+# lookups (yq, jq, curl, etc.) all resolve.
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/.local/bin/code-router-refresh-token
 StandardOutput=journal
 StandardError=journal

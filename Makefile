@@ -17,7 +17,7 @@ CCR_DIR       ?= $(PREFIX)/.claude-code-router
 PLUGIN_DIR    ?= $(CCR_DIR)/plugins
 CA_DIR        ?= $(PREFIX)/.local/share/ca-certs
 NVM_DIR       ?= $(PREFIX)/.nvm
-SHEPHERD_CFG  ?= $(PREFIX)/.config/shepherd/config.json
+ICODE_CFG     ?= $(PREFIX)/.config/icode/config.toml
 
 NODE_VERSION  ?= 22
 NVM_VERSION   ?= v0.40.3
@@ -35,9 +35,10 @@ install: check-prereqs install-node install-router install-ca install-bin \
 
 check-prereqs:
 	@command -v jq >/dev/null      || { echo "ERROR: jq not installed (apt-get install jq)"; exit 1; }
+	@command -v yq >/dev/null      || { echo "ERROR: yq not installed (https://github.com/mikefarah/yq -- the Go variant, supports TOML)"; exit 1; }
 	@command -v curl >/dev/null    || { echo "ERROR: curl not installed"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
-	@test -r $(SHEPHERD_CFG)       || { echo "ERROR: $(SHEPHERD_CFG) not found -- shepherd must be configured first"; exit 1; }
+	@test -r $(ICODE_CFG)          || { echo "ERROR: $(ICODE_CFG) not found -- create it with [[providers]] entries (see README)"; exit 1; }
 
 install-node:
 	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
@@ -75,13 +76,17 @@ install-plugin: | $(PLUGIN_DIR)
 	install -m 0644 plugins/inject-token.js    $(PLUGIN_DIR)/inject-token.js
 
 install-ca: | $(CA_DIR)
-	@HOST=$$(jq -r '.providers[0].base_url' $(SHEPHERD_CFG) | awk -F/ '{print $$3}'); \
-	echo "Fetching CA chain from $$HOST..."; \
-	echo | openssl s_client -connect $$HOST:443 -showcerts 2>/dev/null | \
-		awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' \
-		> $(CA_DIR)/code-router-ca.pem; \
+	@HOSTS=$$(yq -p toml -o json $(ICODE_CFG) | jq -r '.providers[].base_url' | awk -F/ '{print $$3}' | sort -u); \
+	test -n "$$HOSTS" || { echo "ERROR: no provider base_urls found in $(ICODE_CFG)"; exit 1; }; \
+	: > $(CA_DIR)/code-router-ca.pem; \
+	for HOST in $$HOSTS; do \
+		echo "Fetching CA chain from $$HOST..."; \
+		echo | openssl s_client -connect $$HOST:443 -showcerts 2>/dev/null | \
+			awk '/-----BEGIN CERTIFICATE-----/,/-----END CERTIFICATE-----/' \
+			>> $(CA_DIR)/code-router-ca.pem; \
+	done; \
 	test -s $(CA_DIR)/code-router-ca.pem || { echo "ERROR: CA fetch failed"; exit 1; }; \
-	echo "Wrote $(CA_DIR)/code-router-ca.pem ($$(grep -c BEGIN $(CA_DIR)/code-router-ca.pem) cert(s))"
+	echo "Wrote $(CA_DIR)/code-router-ca.pem ($$(grep -c BEGIN $(CA_DIR)/code-router-ca.pem) cert(s) from $$(echo $$HOSTS | wc -w) host(s))"
 
 install-systemd: | $(SYSTEMD_DIR)
 	install -m 0644 systemd/code-router.service $(SYSTEMD_DIR)/code-router.service
