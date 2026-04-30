@@ -1,30 +1,22 @@
 # code-router -- run Claude Code against an OAuth-gated gateway via
 # claude-code-router (CCR), with token refresh handled by systemd.
 #
-# Two install modes:
+# Just type `make install`:
+#   - As root (or sudo)  -> system-wide install: ccr in /usr/local, dedicated
+#                           code-router system user, daemon at boot, state
+#                           under /var/lib/code-router. Any user on the box
+#                           can run `icode`.
+#   - As a normal user   -> per-user install: nvm/Node 22 in $HOME, daemon
+#                           launched lazily by `ccr code`, state under
+#                           ~/.claude-code-router, user-systemd timer.
 #
-#   Per-user (no sudo):
-#     make install            # nvm/Node 22 user-local, ccr installed under
-#                             # nvm; daemon launched lazily by `ccr code`;
-#                             # state under ~/.claude-code-router; user
-#                             # systemd timer rotates the token.
-#     make uninstall
+# `make install` dispatches based on the calling uid; the underlying targets
+# are install-system and install-user if you ever need to be explicit (e.g.
+# a per-user install under the root account: ALLOW_ROOT_USER_INSTALL=1).
 #
-#   System-wide (sudo):
-#     sudo make install-system   # apt install nodejs npm (if missing); ccr
-#                                # to /usr/local; dedicated `code-router`
-#                                # system user runs the daemon at boot;
-#                                # state under /var/lib/code-router; system
-#                                # systemd timer rotates the token.
-#                                # Any user on the box can run `icode`.
-#     sudo make uninstall-system
-#
-# Both modes can coexist on the same machine; icode prefers the per-user
-# install when one exists, otherwise hits the shared system daemon.
-#
-# Other targets:
-#   make status       # show service/timer/daemon status (per-user)
-#   make refresh      # mint a fresh token now (per-user, manual override)
+# Uninstall:    make uninstall   /  sudo make uninstall-system
+# Status:       make status            # per-user only
+# Manual mint:  make refresh           # per-user only
 
 SHELL := /bin/bash
 
@@ -52,7 +44,7 @@ SYS_STATE_DIR   ?= /var/lib/code-router
 SYS_SYSTEMD_DIR ?= /etc/systemd/system
 SYS_USER        ?= code-router
 
-.PHONY: install uninstall status refresh check-prereqs install-node \
+.PHONY: install install-user uninstall status refresh check-prereqs install-node \
         install-router install-bin install-plugin install-ca install-systemd \
         configure \
         install-system uninstall-system check-prereqs-system \
@@ -60,8 +52,21 @@ SYS_USER        ?= code-router
         install-system-plugin install-system-router install-system-ca \
         install-system-systemd configure-system
 
-install: check-prereqs install-node install-router install-bin install-plugin \
-         install-systemd configure
+# `make install` dispatches based on caller: root -> system install (the
+# obvious thing for a sudo'd "install everything" run), non-root -> per-user
+# install. The system path expects the caller to have root, so we just
+# re-invoke the explicit target rather than embedding the dispatch in every
+# downstream target. Override with ALLOW_ROOT_USER_INSTALL=1 if you really
+# want a per-user install under the root account (rare).
+install:
+	@if [ "$$(id -u)" = "0" ] && [ -z "$(ALLOW_ROOT_USER_INSTALL)" ]; then \
+		$(MAKE) install-system; \
+	else \
+		$(MAKE) install-user; \
+	fi
+
+install-user: check-prereqs install-node install-router install-bin install-plugin \
+              install-systemd configure
 	@echo
 	@if test -r $(ICODE_CFG); then \
 		echo "code-router installed."; \
@@ -76,17 +81,6 @@ install: check-prereqs install-node install-router install-bin install-plugin \
 	fi
 
 check-prereqs:
-	@if [ "$$(id -u)" = "0" ] && [ -z "$(ALLOW_ROOT_USER_INSTALL)" ]; then \
-		echo "ERROR: 'make install' is the per-user install -- running it as root would put"; \
-		echo "       icode into /root/.local/bin and is almost never what you want."; \
-		echo ""; \
-		echo "       For a shared system install (any user on this box can run icode):"; \
-		echo "         make install-system"; \
-		echo ""; \
-		echo "       If you truly want a per-user install for the root account, override:"; \
-		echo "         make install ALLOW_ROOT_USER_INSTALL=1"; \
-		exit 1; \
-	fi
 	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed (apt-get install python3)"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
 

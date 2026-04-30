@@ -90,20 +90,25 @@ daemon; nothing kills them.
 
 ## Install
 
-There are two install modes — pick one (or run both, they coexist):
+Just `make install`. It dispatches based on who you are:
 
-- **Per-user install** (`make install`, no sudo). nvm/Node 22 user-local;
-  CCR daemon launched lazily by `ccr code`; state under
-  `~/.claude-code-router`; user-systemd timer rotates the token. Right
-  for laptops, dev machines, single-user boxes.
-- **System install** (`sudo make install-system`). Distro `nodejs` +
+- **As root (or via `sudo`):** system-wide install. Distro `nodejs` +
   `npm`; ccr in `/usr/local`; dedicated `code-router` system user runs
   the daemon at boot; state under `/var/lib/code-router`; system-systemd
   timer rotates the token. Any user on the box can run `icode`. Right
   for shared servers and CI hosts.
+- **As a normal user:** per-user install. nvm/Node 22 user-local; CCR
+  daemon launched lazily by `ccr code`; state under
+  `~/.claude-code-router`; user-systemd timer rotates the token. Right
+  for laptops, dev machines, single-user boxes.
 
-icode auto-detects which is active per invocation (per-user wins when
-present; otherwise hits the shared system daemon).
+The two modes coexist; `icode` auto-detects which is active per
+invocation (per-user wins when one exists for the calling user;
+otherwise hits the shared system daemon).
+
+If you really want a per-user install for the root account (rare),
+use `make install ALLOW_ROOT_USER_INSTALL=1`. To be explicit, the
+underlying targets are `install-system` and `install-user`.
 
 ### Per-user install
 
@@ -118,11 +123,11 @@ make install                             # config-independent setup
 make configure                           # CA fetch + initial token mint
 ```
 
-`make install` is split in two phases so the first phase doesn't
-require credentials yet:
+The flow is split in two phases so the first phase doesn't require
+credentials yet:
 
-**Phase 1 (`make install`):** does everything that doesn't depend on
-your config —
+**Phase 1 (`make install` as a normal user):** does everything that
+doesn't depend on your config —
 
 1. Install **nvm** + **Node 22 LTS** if missing (user-local, no root)
 2. Build the **vendored claude-code-router** in `router/` (patched fork --
