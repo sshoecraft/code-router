@@ -218,6 +218,14 @@ check-prereqs-system:
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
 	@command -v node    >/dev/null || { echo "ERROR: node not installed (try: apt install nodejs npm)"; exit 1; }
 	@command -v npm     >/dev/null || { echo "ERROR: npm not installed (try: apt install nodejs npm)"; exit 1; }
+	@NODE_MAJOR=$$(node -p 'process.versions.node.split(".")[0]'); \
+	if [ "$$NODE_MAJOR" -lt 20 ]; then \
+		echo "ERROR: Node $$NODE_MAJOR is too old (the vendored router uses globals added in Node 20, e.g. File)."; \
+		echo "       Debian 12's apt nodejs is 18 -- install Node 20+ from NodeSource instead:"; \
+		echo "         curl -fsSL https://deb.nodesource.com/setup_22.x | bash -"; \
+		echo "         apt install -y nodejs"; \
+		exit 1; \
+	fi
 
 install-system-user:
 	@if ! getent passwd $(SYS_USER) >/dev/null; then \
