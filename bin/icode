@@ -67,10 +67,18 @@ done
 if [[ -n "$PROVIDER" ]]; then
   if (( SYSTEM_MODE )); then
     # System install: refresh-token writes to /var/lib/code-router/, owned
-    # by the code-router user. Need sudo, then restart the daemon so the
-    # new Router.default takes effect.
+    # by the code-router user, and reads /etc/icode/config.json. Run it
+    # as that user with the same env the systemd unit sets, then restart
+    # the daemon so the new Router.default takes effect.
     echo "icode: switching provider to '$PROVIDER' (requires sudo)..." >&2
-    sudo "$REFRESH_BIN" --provider "$PROVIDER"
+    sudo -u code-router env \
+      HOME=/var/lib/code-router \
+      ICODE_CFG=/etc/icode/config.json \
+      CODE_ROUTER_DIR=/var/lib/code-router/.claude-code-router \
+      CODE_ROUTER_PLUGIN_DIR=/usr/local/share/code-router/plugins \
+      CODE_ROUTER_CA_FILE=/usr/local/share/code-router/ca.pem \
+      NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem \
+      "$REFRESH_BIN" --provider "$PROVIDER"
     sudo systemctl restart code-router.service
   else
     if [[ -x "$REFRESH_BIN" ]]; then
