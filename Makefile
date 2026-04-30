@@ -281,15 +281,6 @@ install-system-router:
 	else \
 		echo "claude-code already installed."; \
 	fi
-	@# NodeSource's apt nodejs sets npm prefix to /usr (not /usr/local), so
-	@# `npm i -g` puts binaries at /usr/bin/ccr. The systemd unit hardcodes
-	@# /usr/local/bin/ccr. Symlink so the unit always finds the binary,
-	@# regardless of which Node distribution provided npm.
-	@CCR_BIN=$$(command -v ccr); \
-	if [ -n "$$CCR_BIN" ] && [ "$$CCR_BIN" != "/usr/local/bin/ccr" ] && [ ! -e /usr/local/bin/ccr ]; then \
-		ln -sf "$$CCR_BIN" /usr/local/bin/ccr; \
-		echo "Symlinked /usr/local/bin/ccr -> $$CCR_BIN"; \
-	fi
 
 install-system-ca:
 	@HOSTS=$$(python3 -c "import json,urllib.parse,sys;cfg=json.load(open('$(SYS_CFG)'));print('\n'.join(sorted({urllib.parse.urlparse(p['base_url']).hostname for p in cfg['providers']})))"); \

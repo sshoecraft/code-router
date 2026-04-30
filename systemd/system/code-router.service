@@ -22,7 +22,11 @@ Environment=NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem
 # rotation is invisible to in-flight sessions.
 Environment=ANTHROPIC_TOKEN_FILE=/var/lib/code-router/.claude-code-router/token.txt
 
-ExecStart=/usr/local/bin/ccr start
+# Resolve `ccr` via PATH instead of hardcoding /usr/local/bin/ccr -- different
+# Node distributions install npm-global binaries to different prefixes
+# (NodeSource's apt nodejs uses /usr, traditional builds use /usr/local).
+# /usr/bin/env is universally present and finds ccr wherever it is.
+ExecStart=/usr/bin/env ccr start
 Restart=always
 RestartSec=2
 

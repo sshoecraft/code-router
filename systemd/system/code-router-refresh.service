@@ -22,6 +22,8 @@ Environment=CODE_ROUTER_PLUGIN_DIR=/usr/local/share/code-router/plugins
 Environment=CODE_ROUTER_CA_FILE=/usr/local/share/code-router/ca.pem
 Environment=NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem
 
+# refresh-token script is installed by `make install-system` to /usr/local/bin
+# (controlled by us, unlike npm-global binaries) -- absolute path is fine here.
 ExecStart=/usr/local/bin/code-router-refresh-token
 
 # Hardening
