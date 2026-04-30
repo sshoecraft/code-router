@@ -76,6 +76,17 @@ install: check-prereqs install-node install-router install-bin install-plugin \
 	fi
 
 check-prereqs:
+	@if [ "$$(id -u)" = "0" ] && [ -z "$(ALLOW_ROOT_USER_INSTALL)" ]; then \
+		echo "ERROR: 'make install' is the per-user install -- running it as root would put"; \
+		echo "       icode into /root/.local/bin and is almost never what you want."; \
+		echo ""; \
+		echo "       For a shared system install (any user on this box can run icode):"; \
+		echo "         make install-system"; \
+		echo ""; \
+		echo "       If you truly want a per-user install for the root account, override:"; \
+		echo "         make install ALLOW_ROOT_USER_INSTALL=1"; \
+		exit 1; \
+	fi
 	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed (apt-get install python3)"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
 
