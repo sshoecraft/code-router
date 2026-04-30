@@ -83,12 +83,25 @@ if [[ -n "$PROVIDER" ]]; then
 fi
 
 if (( SYSTEM_MODE )); then
-  # Daemon is started at boot by systemd; it has its own NODE_EXTRA_CA_CERTS
-  # and ANTHROPIC_TOKEN_FILE from the unit file. icode just needs ccr on PATH.
-  if ! command -v ccr >/dev/null 2>&1; then
-    echo "icode: ccr not on PATH (system install incomplete?)" >&2
+  # System mode: the daemon is started at boot by systemd, listening on
+  # 127.0.0.1:3456. Don't go through `ccr code` -- its `isServiceRunning()`
+  # check looks at the *calling user's* $HOME/.claude-code-router/.pid file
+  # and won't see the shared daemon's PID file in /var/lib/code-router.
+  # That makes `ccr code` try to start its own daemon, hit port-busy, and
+  # time out. Instead, set the same env vars `ccr code` would have set
+  # (per createEnvVariables in the vendored router) and exec `claude`
+  # directly.
+  if ! command -v claude >/dev/null 2>&1; then
+    echo "icode: claude not on PATH (claude-code not installed?)" >&2
     exit 1
   fi
+  export ANTHROPIC_BASE_URL="http://127.0.0.1:3456"
+  export ANTHROPIC_AUTH_TOKEN="test"          # CCR ignores; auth handled inside daemon
+  export NO_PROXY="127.0.0.1"
+  export DISABLE_TELEMETRY="true"
+  export DISABLE_COST_WARNINGS="true"
+  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}"
+  unset CLAUDE_CODE_USE_BEDROCK
 else
   # Per-user mode: bootstrap CCR config on first run; load nvm; set CA bundle
   # and token file env vars so the daemon (spawned by ccr code) inherits them.
@@ -128,4 +141,8 @@ if (( ! SAFE_MODE )); then
   SKIP_PERMS=(--dangerously-skip-permissions)
 fi
 
-exec ccr code ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+if (( SYSTEM_MODE )); then
+  exec claude ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+else
+  exec ccr code ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
+fi
