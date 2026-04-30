@@ -83,14 +83,13 @@ check-prereqs:
 configure:
 	@if ! test -r $(ICODE_CFG); then \
 		echo "configure: $(ICODE_CFG) not present yet -- skipping CA fetch + token mint."; \
-		exit 0; \
-	fi
-	@if grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(ICODE_CFG); then \
+	elif grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(ICODE_CFG); then \
 		echo "ERROR: $(ICODE_CFG) still has placeholder values from the example."; \
 		echo "       Edit it with real values, then re-run: make configure"; \
 		exit 1; \
+	else \
+		$(MAKE) install-ca refresh; \
 	fi
-	@$(MAKE) install-ca refresh
 
 install-node:
 	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
@@ -284,23 +283,20 @@ install-system-systemd:
 # daemon so it picks up the populated config.
 configure-system:
 	@if [ "$$(id -u)" != "0" ]; then \
-		echo "ERROR: configure-system requires root (try: sudo make configure-system)"; exit 1; \
-	fi
-	@if ! test -r $(SYS_CFG); then \
-		echo "configure-system: $(SYS_CFG) not present yet -- skipping CA fetch + token mint."; \
-		exit 0; \
-	fi
-	@if grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(SYS_CFG); then \
-		echo "ERROR: $(SYS_CFG) still has placeholder values from the example."; \
-		echo "       Edit the file (e.g. 'sudo nano $(SYS_CFG)') and replace every"; \
-		echo "       REPLACE_ME / gateway.example.com / your-okta-tenant with real values,"; \
-		echo "       then re-run: sudo make configure-system"; \
+		echo "ERROR: configure-system requires root (try: sudo make configure-system)"; \
 		exit 1; \
+	elif ! test -r $(SYS_CFG); then \
+		echo "configure-system: $(SYS_CFG) not present yet -- skipping CA fetch + token mint."; \
+	elif grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(SYS_CFG); then \
+		echo "ERROR: $(SYS_CFG) still has placeholder values from the example."; \
+		echo "       Edit the file with real values, then re-run: sudo make configure-system"; \
+		exit 1; \
+	else \
+		$(MAKE) install-system-ca; \
+		systemctl start code-router-refresh.service; \
+		systemctl restart code-router.service; \
+		echo "Daemon restarted with active provider; check 'systemctl status code-router'."; \
 	fi
-	@$(MAKE) install-system-ca
-	@systemctl start code-router-refresh.service
-	@systemctl restart code-router.service
-	@echo "Daemon restarted with active provider; check 'systemctl status code-router'."
 
 uninstall-system:
 	@if [ "$$(id -u)" != "0" ]; then \
