@@ -121,7 +121,14 @@ install-router:
 	cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null 2>&1 && \
 	echo "Installing globally..." && \
 	npm i -g $(ROUTER_SRC) >/dev/null 2>&1 && \
-	echo "claude-code-router installed from vendored source."
+	echo "claude-code-router installed from vendored source." && \
+	if ! command -v claude >/dev/null 2>&1; then \
+		echo "Installing Claude Code (@anthropic-ai/claude-code)..."; \
+		npm i -g @anthropic-ai/claude-code >/dev/null && \
+		echo "claude-code installed."; \
+	else \
+		echo "claude-code already installed."; \
+	fi
 
 install-bin: | $(BIN_DIR)
 	install -m 0755 bin/icode                     $(BIN_DIR)/icode
@@ -267,6 +274,13 @@ install-system-router:
 	@echo "Installing globally (system Node)..."
 	@npm i -g $(ROUTER_SRC) >/dev/null
 	@echo "claude-code-router installed system-wide."
+	@if ! command -v claude >/dev/null 2>&1; then \
+		echo "Installing Claude Code (@anthropic-ai/claude-code) system-wide..."; \
+		npm i -g @anthropic-ai/claude-code >/dev/null && \
+		echo "claude-code installed."; \
+	else \
+		echo "claude-code already installed."; \
+	fi
 
 install-system-ca:
 	@HOSTS=$$(python3 -c "import json,urllib.parse,sys;cfg=json.load(open('$(SYS_CFG)'));print('\n'.join(sorted({urllib.parse.urlparse(p['base_url']).hostname for p in cfg['providers']})))"); \

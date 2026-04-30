@@ -35,19 +35,23 @@ if [[ -z "${ICODE_CFG:-}" ]]; then
 fi
 export ICODE_CFG
 
-# Per-user install wins when present; otherwise fall back to the shared
-# system install. We detect by the location of the refresh script -- it's
-# the most direct signal of which `make install` ran.
-if [[ -x "${HOME}/.local/bin/code-router-refresh-token" ]]; then
-  SYSTEM_MODE=0
-  REFRESH_BIN="${HOME}/.local/bin/code-router-refresh-token"
-  NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-  CCR_CFG="${HOME}/.claude-code-router/config.json"
-elif [[ -x "/usr/local/bin/code-router-refresh-token" ]]; then
+# Mode is determined by where THIS icode script is installed -- the
+# system-install copy lives in /usr/local/bin, the per-user copy lives in
+# ~/.local/bin. Looking at $0 avoids the failure mode where leftover state
+# in $HOME made an old per-user install ambient even when the user clearly
+# typed the system one (and vice versa).
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
+if [[ "$SCRIPT_DIR" == "/usr/local/bin" ]]; then
   SYSTEM_MODE=1
   REFRESH_BIN="/usr/local/bin/code-router-refresh-token"
 else
-  echo "icode: no install found -- run 'make install' or 'sudo make install-system'" >&2
+  SYSTEM_MODE=0
+  REFRESH_BIN="${SCRIPT_DIR}/code-router-refresh-token"
+  NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
+  CCR_CFG="${HOME}/.claude-code-router/config.json"
+fi
+if [[ ! -x "$REFRESH_BIN" ]]; then
+  echo "icode: $REFRESH_BIN missing -- run 'make install' or 'make install' as root" >&2
   exit 1
 fi
 
