@@ -110,15 +110,12 @@ present; otherwise hits the shared system daemon).
 ```bash
 git clone <this-repo> ~/src/code-router  # or scp
 cd ~/src/code-router
-make install                                       # config-independent setup
+make install                             # config-independent setup
 
-# Now create your provider config (or edit if it already exists):
-mkdir -p ~/.config/icode
-cp config.example.json ~/.config/icode/config.json
-chmod 600 ~/.config/icode/config.json
-$EDITOR ~/.config/icode/config.json                # fill in the REPLACE_ME values
+# Create or edit ~/.config/icode/config.json with your provider entries
+# (template at ./config.example.json). The file should be mode 0600.
 
-make configure                                     # CA fetch + initial token mint
+make configure                           # CA fetch + initial token mint
 ```
 
 `make install` is split in two phases so the first phase doesn't
@@ -159,11 +156,9 @@ git clone <this-repo> /opt/code-router  # or wherever you build from
 cd /opt/code-router
 sudo make install-system                # config-independent setup
 
-# Now create the shared provider config:
-sudo cp config.example.json /etc/icode/config.json
-sudo chown root:code-router /etc/icode/config.json
-sudo chmod 0640 /etc/icode/config.json
-sudo $EDITOR /etc/icode/config.json     # fill in the REPLACE_ME values
+# Create or edit /etc/icode/config.json with your provider entries
+# (template at ./config.example.json). The file should be owned
+# root:code-router and mode 0640.
 
 sudo make configure-system              # CA fetch, mint token, restart daemon
 ```

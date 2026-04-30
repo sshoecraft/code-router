@@ -70,14 +70,9 @@ install: check-prereqs install-node install-router install-bin install-plugin \
 	else \
 		echo "code-router installed (config pending)."; \
 		echo ""; \
-		echo "  Next: create $(ICODE_CFG) with your provider entries."; \
-		echo "        A starter template is at $(CURDIR)/config.example.json"; \
-		echo ""; \
-		echo "        cp $(CURDIR)/config.example.json $(ICODE_CFG)"; \
-		echo "        chmod 600 $(ICODE_CFG)"; \
-		echo "        \$$EDITOR $(ICODE_CFG)"; \
-		echo ""; \
-		echo "        Then: make configure"; \
+		echo "  Next: create or edit $(ICODE_CFG) with your provider entries"; \
+		echo "        (template at $(CURDIR)/config.example.json),"; \
+		echo "        then run: make configure"; \
 	fi
 
 check-prereqs:
@@ -86,11 +81,16 @@ check-prereqs:
 
 # Config-dependent finishing steps. Safe to re-run after editing the config.
 configure:
-	@if test -r $(ICODE_CFG); then \
-		$(MAKE) install-ca refresh; \
-	else \
+	@if ! test -r $(ICODE_CFG); then \
 		echo "configure: $(ICODE_CFG) not present yet -- skipping CA fetch + token mint."; \
+		exit 0; \
 	fi
+	@if grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(ICODE_CFG); then \
+		echo "ERROR: $(ICODE_CFG) still has placeholder values from the example."; \
+		echo "       Edit it with real values, then re-run: make configure"; \
+		exit 1; \
+	fi
+	@$(MAKE) install-ca refresh
 
 install-node:
 	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
@@ -206,13 +206,9 @@ install-system: check-prereqs-system install-system-user install-system-dirs \
 	else \
 		echo "code-router system install complete (config pending)."; \
 		echo ""; \
-		echo "  Next: populate $(SYS_CFG) with your provider entries."; \
-		echo "        sudo cp $(CURDIR)/config.example.json $(SYS_CFG)"; \
-		echo "        sudo chown root:$(SYS_USER) $(SYS_CFG)"; \
-		echo "        sudo chmod 0640 $(SYS_CFG)"; \
-		echo "        sudo \$$EDITOR $(SYS_CFG)"; \
-		echo ""; \
-		echo "        Then: sudo make configure-system"; \
+		echo "  Next: create or edit $(SYS_CFG) with your provider entries"; \
+		echo "        (template at $(CURDIR)/config.example.json),"; \
+		echo "        then run: sudo make configure-system"; \
 	fi
 
 check-prereqs-system:
@@ -290,14 +286,21 @@ configure-system:
 	@if [ "$$(id -u)" != "0" ]; then \
 		echo "ERROR: configure-system requires root (try: sudo make configure-system)"; exit 1; \
 	fi
-	@if test -r $(SYS_CFG); then \
-		$(MAKE) install-system-ca; \
-		systemctl start code-router-refresh.service; \
-		systemctl restart code-router.service; \
-		echo "Daemon restarted with active provider; check 'systemctl status code-router'."; \
-	else \
+	@if ! test -r $(SYS_CFG); then \
 		echo "configure-system: $(SYS_CFG) not present yet -- skipping CA fetch + token mint."; \
+		exit 0; \
 	fi
+	@if grep -q "REPLACE_ME\|gateway\.example\.com\|your-okta-tenant" $(SYS_CFG); then \
+		echo "ERROR: $(SYS_CFG) still has placeholder values from the example."; \
+		echo "       Edit the file (e.g. 'sudo nano $(SYS_CFG)') and replace every"; \
+		echo "       REPLACE_ME / gateway.example.com / your-okta-tenant with real values,"; \
+		echo "       then re-run: sudo make configure-system"; \
+		exit 1; \
+	fi
+	@$(MAKE) install-system-ca
+	@systemctl start code-router-refresh.service
+	@systemctl restart code-router.service
+	@echo "Daemon restarted with active provider; check 'systemctl status code-router'."
 
 uninstall-system:
 	@if [ "$$(id -u)" != "0" ]; then \
