@@ -12,6 +12,7 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
+import { registerAdminRoutes } from "@/admin";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -641,6 +642,11 @@ export const registerApiRoutes = async (
       return { message: "Provider deleted successfully" };
     }
   );
+
+  // code-router admin endpoints (localhost-only): prime a token, look up a
+  // model, list configured icode providers. Used by `icode` to drive the
+  // daemon from outside without needing to read credentials itself.
+  await registerAdminRoutes(fastify);
 
   fastify.patch(
     "/providers/:id/toggle",

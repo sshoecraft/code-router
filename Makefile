@@ -6,9 +6,11 @@
 #                           code-router system user, daemon at boot, state
 #                           under /var/lib/code-router. Any user on the box
 #                           can run `icode`.
-#   - As a normal user   -> per-user install: nvm/Node 22 in $HOME, daemon
-#                           launched lazily by `ccr code`, state under
-#                           ~/.claude-code-router, user-systemd timer.
+#   - As a normal user   -> per-user install: needs Node 20+ already on PATH
+#                           (we don't bundle Node anymore -- nvm/fnm/asdf
+#                           are all fine). Daemon spawned lazily by icode,
+#                           state under ~/.claude-code-router, user-systemd
+#                           timer for token rotation.
 #
 # `make install` dispatches based on the calling uid; the underlying targets
 # are install-system and install-user if you ever need to be explicit (e.g.
@@ -26,11 +28,8 @@ SYSTEMD_DIR   ?= $(PREFIX)/.config/systemd/user
 CCR_DIR       ?= $(PREFIX)/.claude-code-router
 PLUGIN_DIR    ?= $(CCR_DIR)/plugins
 CA_DIR        ?= $(PREFIX)/.local/share/ca-certs
-NVM_DIR       ?= $(PREFIX)/.nvm
 ICODE_CFG     ?= $(PREFIX)/.config/icode/config.json
 
-NODE_VERSION  ?= 22
-NVM_VERSION   ?= v0.40.3
 ROUTER_SRC    := $(CURDIR)/router
 
 # System-mode paths (used by install-system / uninstall-system targets).
@@ -44,7 +43,7 @@ SYS_STATE_DIR   ?= /var/lib/code-router
 SYS_SYSTEMD_DIR ?= /etc/systemd/system
 SYS_USER        ?= code-router
 
-.PHONY: install install-user uninstall status refresh check-prereqs install-node \
+.PHONY: install install-user uninstall status refresh check-prereqs \
         install-router install-bin install-plugin install-ca install-systemd \
         configure \
         install-system uninstall-system check-prereqs-system \
@@ -65,7 +64,7 @@ install:
 		$(MAKE) install-user; \
 	fi
 
-install-user: check-prereqs install-node install-router install-bin install-plugin \
+install-user: check-prereqs install-router install-bin install-plugin \
               install-systemd configure
 	@echo
 	@if test -r $(ICODE_CFG); then \
@@ -83,6 +82,22 @@ install-user: check-prereqs install-node install-router install-bin install-plug
 check-prereqs:
 	@command -v python3 >/dev/null || { echo "ERROR: python3 not installed (apt-get install python3)"; exit 1; }
 	@command -v openssl >/dev/null || { echo "ERROR: openssl not installed"; exit 1; }
+	@command -v node    >/dev/null || { echo "ERROR: node not on PATH (install Node 20+ via nvm, fnm, asdf, NodeSource, etc.)"; exit 1; }
+	@command -v npm     >/dev/null || { echo "ERROR: npm not on PATH"; exit 1; }
+	@NODE_MAJOR=$$(node -p 'process.versions.node.split(".")[0]'); \
+	if [ "$$NODE_MAJOR" -lt 20 ]; then \
+		echo "ERROR: Node $$NODE_MAJOR is too old (router needs >=20 for the File global)."; \
+		echo "       Install a recent Node from nvm/fnm/asdf/NodeSource and re-run 'make install'."; \
+		exit 1; \
+	fi
+	@NPM_PREFIX=$$(npm config get prefix 2>/dev/null); \
+	if [ ! -w "$$NPM_PREFIX" ]; then \
+		echo "ERROR: npm global prefix '$$NPM_PREFIX' is not writable as $$USER."; \
+		echo "       Either use a user-scoped Node (nvm/fnm) or set a writable prefix:"; \
+		echo "         npm config set prefix \$$HOME/.local"; \
+		echo "         export PATH=\$$HOME/.local/bin:\$$PATH"; \
+		exit 1; \
+	fi
 
 # Config-dependent finishing steps. Safe to re-run after editing the config.
 configure:
@@ -96,33 +111,17 @@ configure:
 		$(MAKE) install-ca refresh; \
 	fi
 
-install-node:
-	@if [ ! -s $(NVM_DIR)/nvm.sh ]; then \
-		echo "Installing nvm $(NVM_VERSION)..."; \
-		curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/$(NVM_VERSION)/install.sh | bash; \
-	else \
-		echo "nvm already installed."; \
-	fi
-	@. $(NVM_DIR)/nvm.sh; \
-	if ! nvm ls $(NODE_VERSION) >/dev/null 2>&1; then \
-		echo "Installing Node $(NODE_VERSION)..."; \
-		nvm install $(NODE_VERSION); \
-	else \
-		echo "Node $(NODE_VERSION) already installed."; \
-	fi
-
 install-router:
-	@. $(NVM_DIR)/nvm.sh && nvm use --delete-prefix --silent $(NODE_VERSION) && \
-	if ! command -v pnpm >/dev/null 2>&1; then \
-		echo "Installing pnpm (required to build the vendored router)..."; \
+	@if ! command -v pnpm >/dev/null 2>&1; then \
+		echo "Installing pnpm (required to build the router)..."; \
 		npm i -g pnpm@9 >/dev/null 2>&1; \
-	fi; \
-	echo "Building vendored claude-code-router from $(ROUTER_SRC)..."; \
-	cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null 2>&1 && \
-	echo "Installing globally..." && \
-	npm i -g $(ROUTER_SRC) >/dev/null 2>&1 && \
-	echo "claude-code-router installed from vendored source." && \
-	if ! command -v claude >/dev/null 2>&1; then \
+	fi
+	@echo "Building the router from $(ROUTER_SRC)..."
+	@cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null 2>&1
+	@echo "Installing globally..."
+	@npm i -g $(ROUTER_SRC) >/dev/null 2>&1
+	@echo "Router installed from $(ROUTER_SRC)."
+	@if ! command -v claude >/dev/null 2>&1; then \
 		echo "Installing Claude Code (@anthropic-ai/claude-code)..."; \
 		npm i -g @anthropic-ai/claude-code >/dev/null && \
 		echo "claude-code installed."; \
@@ -137,6 +136,10 @@ install-bin: | $(BIN_DIR)
 install-plugin: | $(PLUGIN_DIR)
 	install -m 0644 plugins/strip-reasoning.js $(PLUGIN_DIR)/strip-reasoning.js
 	install -m 0644 plugins/inject-token.js    $(PLUGIN_DIR)/inject-token.js
+	@install -d -m 0700 $(CCR_DIR)/tokens
+	@install -d -m 0700 $(CCR_DIR)/used
+	@mkdir -p $(dir $(ICODE_CFG))
+	@install -m 0644 default.toml.example $(dir $(ICODE_CFG))default.toml.example
 
 install-ca: | $(CA_DIR)
 	@HOSTS=$$(python3 -c "import json,urllib.parse,sys;cfg=json.load(open('$(ICODE_CFG)'));print('\n'.join(sorted({urllib.parse.urlparse(p['base_url']).hostname for p in cfg['providers']})))"); \
@@ -182,7 +185,7 @@ status:
 	@systemctl --user status code-router.service --no-pager 2>/dev/null | sed -n '1,3p;/ExecStart=/d;/^\s*$$/d' | tail -10 || echo "(service not installed)"
 	@echo
 	@echo "=== ccr daemon ==="
-	@. $(NVM_DIR)/nvm.sh 2>/dev/null && nvm use --delete-prefix --silent $(NODE_VERSION) >/dev/null 2>&1 && ccr status 2>&1 || echo "ccr: not on PATH"
+	@command -v ccr >/dev/null && ccr status 2>&1 || echo "ccr: not on PATH"
 
 uninstall:
 	-systemctl --user disable --now code-router.timer 2>/dev/null
@@ -192,10 +195,9 @@ uninstall:
 	-rm -f $(PLUGIN_DIR)/strip-reasoning.js $(PLUGIN_DIR)/inject-token.js
 	-rm -f $(CCR_DIR)/token.txt
 	-rm -f $(CA_DIR)/code-router-ca.pem
-	-. $(NVM_DIR)/nvm.sh 2>/dev/null && nvm use --delete-prefix --silent $(NODE_VERSION) >/dev/null 2>&1 && ccr stop 2>/dev/null || true
-	@echo "Uninstalled. Note: nvm, Node $(NODE_VERSION), and CCR were not removed."
-	@echo "  - To remove CCR: npm uninstall -g @musistudio/claude-code-router"
-	@echo "  - To remove nvm: rm -rf $(NVM_DIR) and remove sourcing lines from ~/.bashrc"
+	-command -v ccr >/dev/null && ccr stop 2>/dev/null || true
+	@echo "Uninstalled. Note: the router (ccr) was not removed."
+	@echo "  - To remove the router: npm uninstall -g @musistudio/claude-code-router"
 
 $(BIN_DIR) $(PLUGIN_DIR) $(CA_DIR) $(SYSTEMD_DIR):
 	@mkdir -p $@
@@ -232,7 +234,7 @@ check-prereqs-system:
 	@command -v npm     >/dev/null || { echo "ERROR: npm not installed (try: apt install nodejs npm)"; exit 1; }
 	@NODE_MAJOR=$$(node -p 'process.versions.node.split(".")[0]'); \
 	if [ "$$NODE_MAJOR" -lt 20 ]; then \
-		echo "ERROR: Node $$NODE_MAJOR is too old (the vendored router uses globals added in Node 20, e.g. File)."; \
+		echo "ERROR: Node $$NODE_MAJOR is too old (the the router uses globals added in Node 20, e.g. File)."; \
 		echo "       Debian 12's apt nodejs is 18 -- install Node 20+ from NodeSource instead:"; \
 		echo "         curl -fsSL https://deb.nodesource.com/setup_22.x | bash -"; \
 		echo "         apt install -y nodejs"; \
@@ -255,6 +257,9 @@ install-system-dirs:
 	@install -d -m 0750 -o root -g $(SYS_USER)       $(SYS_CFG_DIR)
 	@install -d -m 0750 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)
 	@install -d -m 0750 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)/.claude-code-router
+	@install -d -m 0700 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)/.claude-code-router/tokens
+	@install -d -m 0700 -o $(SYS_USER) -g $(SYS_USER) $(SYS_STATE_DIR)/.claude-code-router/used
+	@install -m 0644 default.toml.example $(SYS_CFG_DIR)/default.toml.example
 
 install-system-bin:
 	@install -m 0755 bin/icode                     $(SYS_BIN_DIR)/icode
@@ -266,10 +271,10 @@ install-system-plugin:
 
 install-system-router:
 	@if ! command -v pnpm >/dev/null 2>&1; then \
-		echo "Installing pnpm globally (required to build the vendored router)..."; \
+		echo "Installing pnpm globally (required to build the the router)..."; \
 		npm i -g pnpm@9 >/dev/null; \
 	fi
-	@echo "Building vendored claude-code-router from $(ROUTER_SRC)..."
+	@echo "Building the router from $(ROUTER_SRC)..."
 	@cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null
 	@echo "Installing globally (system Node)..."
 	@npm i -g $(ROUTER_SRC) >/dev/null

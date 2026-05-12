@@ -1,162 +1,288 @@
-#!/usr/bin/env bash
-# icode -- run Claude Code through claude-code-router (CCR), routing to the
-# active provider configured in the icode config.
-#
-# Two install modes are supported:
-#
-#   System install (sudo make install):
-#     ICODE_CFG=/etc/icode/config.json
-#     CCR daemon runs at boot under systemd, port 3456, owned by user
-#     code-router. Provider switching is admin-only (sudo).
-#
-#   Per-user install (make install-user):
-#     ICODE_CFG=$HOME/.config/icode/config.json
-#     CCR daemon is launched lazily by `ccr code` from this script; user
-#     systemd timer rotates the token.
-#
-# Flags consumed here (NOT forwarded to claude-code):
-#   --provider NAME   switch the active provider (system mode: requires sudo)
-#   --list            list configured providers and exit
-#   --safe            keep claude-code's permission prompts (default: skip)
+#!/usr/bin/env python3
+"""icode -- run Claude Code through the local code-router daemon, routing
+this session to a chosen provider.
 
-set -euo pipefail
+The single daemon serves any number of providers concurrently; per-session
+selection happens via the --model flag we pass through to claude-code, which
+the daemon parses as "provider,model" and dispatches per request.
 
-# Defaults match per-user install; system install overrides via /etc/profile.d
-# or by sourcing /etc/icode/icode.env. ICODE_CFG falls back to /etc/icode if
-# the user hasn't created their own.
-SYSTEM_CFG="/etc/icode/config.json"
-USER_CFG="${HOME}/.config/icode/config.json"
-if [[ -z "${ICODE_CFG:-}" ]]; then
-  if [[ -r "$USER_CFG" ]]; then
-    ICODE_CFG="$USER_CFG"
-  else
-    ICODE_CFG="$SYSTEM_CFG"
-  fi
-fi
-export ICODE_CFG
+This launcher does three things:
 
-# Mode is determined by where THIS icode script is installed -- the
-# system-install copy lives in /usr/local/bin, the per-user copy lives in
-# ~/.local/bin. Looking at $0 avoids the failure mode where leftover state
-# in $HOME made an old per-user install ambient even when the user clearly
-# typed the system one (and vice versa).
-SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0")")" && pwd)"
-if [[ "$SCRIPT_DIR" == "/usr/local/bin" ]]; then
-  SYSTEM_MODE=1
-  REFRESH_BIN="/usr/local/bin/code-router-refresh-token"
-else
-  SYSTEM_MODE=0
-  REFRESH_BIN="${SCRIPT_DIR}/code-router-refresh-token"
-  NVM_DIR="${NVM_DIR:-$HOME/.nvm}"
-  CCR_CFG="${HOME}/.claude-code-router/config.json"
-fi
-if [[ ! -x "$REFRESH_BIN" ]]; then
-  echo "icode: $REFRESH_BIN missing -- run 'make install' or 'make install' as root" >&2
-  exit 1
-fi
+  1. Resolve which provider this session uses
+       --provider NAME flag, else default.toml, else error.
 
-PROVIDER=""
-SAFE_MODE=0
-FORWARD_ARGS=()
-while (( $# )); do
-  case "$1" in
-    --provider) PROVIDER="${2:-}"; shift 2 ;;
-    --provider=*) PROVIDER="${1#*=}"; shift ;;
-    --list) exec "${REFRESH_BIN}" --list ;;
-    --safe) SAFE_MODE=1; shift ;;
-    *) FORWARD_ARGS+=("$1"); shift ;;
-  esac
-done
+  2. Prime that provider's OAuth token by calling the daemon's localhost-only
+     admin endpoint:
+        POST http://127.0.0.1:3456/__admin/prime  {"provider": NAME}
+     The daemon (running as user code-router in system mode, or as the
+     invoking user in per-user mode) reads the icode config, mints the
+     token, and writes tokens/<NAME>.txt. icode never touches credentials.
 
-if [[ -n "$PROVIDER" ]]; then
-  if (( SYSTEM_MODE )); then
-    # System install: refresh-token writes to /var/lib/code-router/, owned
-    # by the code-router user, and reads /etc/icode/config.json. Run it
-    # as that user with the same env the systemd unit sets, then restart
-    # the daemon so the new Router.default takes effect.
-    echo "icode: switching provider to '$PROVIDER' (requires sudo)..." >&2
-    sudo -u code-router env \
-      HOME=/var/lib/code-router \
-      ICODE_CFG=/etc/icode/config.json \
-      CODE_ROUTER_DIR=/var/lib/code-router/.claude-code-router \
-      CODE_ROUTER_PLUGIN_DIR=/usr/local/share/code-router/plugins \
-      CODE_ROUTER_CA_FILE=/usr/local/share/code-router/ca.pem \
-      NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem \
-      "$REFRESH_BIN" --provider "$PROVIDER"
-    sudo systemctl restart code-router.service
-  else
-    if [[ -x "$REFRESH_BIN" ]]; then
-      "$REFRESH_BIN" --provider "$PROVIDER"
-    else
-      echo "icode: $REFRESH_BIN not found -- run 'make install'" >&2
-      exit 1
-    fi
-  fi
-fi
+  3. Look up the configured model name (GET /__admin/model?provider=NAME)
+     and exec `claude --model NAME,<model> ...` with the env vars that
+     point claude-code at the local daemon.
 
-if (( SYSTEM_MODE )); then
-  # System mode: the daemon is started at boot by systemd, listening on
-  # 127.0.0.1:3456. Don't go through `ccr code` -- its `isServiceRunning()`
-  # check looks at the *calling user's* $HOME/.claude-code-router/.pid file
-  # and won't see the shared daemon's PID file in /var/lib/code-router.
-  # That makes `ccr code` try to start its own daemon, hit port-busy, and
-  # time out. Instead, set the same env vars `ccr code` would have set
-  # (per createEnvVariables in the vendored router) and exec `claude`
-  # directly.
-  if ! command -v claude >/dev/null 2>&1; then
-    echo "icode: claude not on PATH (claude-code not installed?)" >&2
-    exit 1
-  fi
-  export ANTHROPIC_BASE_URL="http://127.0.0.1:3456"
-  export ANTHROPIC_AUTH_TOKEN="test"          # CCR ignores; auth handled inside daemon
-  export NO_PROXY="127.0.0.1"
-  export DISABLE_TELEMETRY="true"
-  export DISABLE_COST_WARNINGS="true"
-  export API_TIMEOUT_MS="${API_TIMEOUT_MS:-600000}"
-  unset CLAUDE_CODE_USE_BEDROCK
-else
-  # Per-user mode: bootstrap CCR config on first run; load nvm; set CA bundle
-  # and token file env vars so the daemon (spawned by ccr code) inherits them.
-  if [[ ! -r "$CCR_CFG" ]]; then
-    if [[ -x "$REFRESH_BIN" ]]; then
-      "$REFRESH_BIN"
-    else
-      echo "icode: $REFRESH_BIN not found -- run 'make install-user'" >&2
-      exit 1
-    fi
-  fi
-  if [[ -s "$NVM_DIR/nvm.sh" ]]; then
-    unset PREFIX
-    # shellcheck disable=SC1091
-    . "$NVM_DIR/nvm.sh"
-    nvm use --delete-prefix --silent 22 >/dev/null
-  fi
-  CA_FILE="${HOME}/.local/share/ca-certs/code-router-ca.pem"
-  if [[ -r "$CA_FILE" ]]; then
-    export NODE_EXTRA_CA_CERTS="$CA_FILE"
-  fi
-  export ANTHROPIC_TOKEN_FILE="${HOME}/.claude-code-router/token.txt"
-  # Restart per-user daemon after a provider switch so it picks up the new
-  # Router.default. (System mode handled this via systemctl restart above.)
-  if [[ -n "$PROVIDER" ]]; then
-    ccr restart >/dev/null 2>&1 || true
-  fi
-fi
+Install modes (auto-detected from $0's directory):
+  /usr/local/bin/icode  -> system mode (daemon started by systemd at boot)
+  anywhere else         -> per-user mode (daemon spawned lazily by `ccr start`)
 
-# Bump the Read tool's per-call token cap from the default 25k to 128k so
-# large MCP tool results (e.g. read_workpaper dumping a multi-sheet xlsx)
-# don't blow up the model's ingestion path. Caller can override.
-export CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS="${CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS:-128000}"
+Flags consumed here (NOT forwarded to claude-code):
+  --provider NAME   route this session to NAME (NOT a global switch)
+  --list            list configured providers and exit
+  --safe            keep claude-code's permission prompts (default: skip)
+"""
 
-SKIP_PERMS=()
-# claude-code refuses --dangerously-skip-permissions for root/sudo, so only
-# add it when we're not root and the user didn't ask for --safe.
-if (( ! SAFE_MODE )) && [[ "$(id -u)" != "0" ]]; then
-  SKIP_PERMS=(--dangerously-skip-permissions)
-fi
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from pathlib import Path
 
-if (( SYSTEM_MODE )); then
-  exec claude ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-else
-  exec ccr code ${SKIP_PERMS[@]+"${SKIP_PERMS[@]}"} ${FORWARD_ARGS[@]+"${FORWARD_ARGS[@]}"}
-fi
+# ---- discover paths -------------------------------------------------------
+
+HOME = Path.home()
+SCRIPT_DIR = Path(__file__).resolve().parent
+SYSTEM_MODE = str(SCRIPT_DIR) == "/usr/local/bin"
+
+USER_CFG = HOME / ".config" / "icode" / "config.json"
+SYSTEM_CFG = Path("/etc/icode/config.json")
+ICODE_CFG = Path(os.environ.get("ICODE_CFG") or (USER_CFG if USER_CFG.is_file() else SYSTEM_CFG))
+ICODE_CFG_DIR = ICODE_CFG.parent
+DEFAULT_FILE = ICODE_CFG_DIR / "default.toml"
+
+DAEMON_BASE = os.environ.get("CODE_ROUTER_DAEMON_BASE", "http://127.0.0.1:3456")
+
+# ---- helpers --------------------------------------------------------------
+
+
+def die(msg: str, code: int = 1) -> None:
+    print(f"icode: {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def read_default_provider() -> str | None:
+    """Hand-parse default.toml -- one line: provider = "name"."""
+    if not DEFAULT_FILE.is_file():
+        return None
+    try:
+        text = DEFAULT_FILE.read_text()
+    except OSError as e:
+        die(f"{DEFAULT_FILE}: {e}")
+    import re
+    m = re.search(r'^\s*provider\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    if not m:
+        die(f'{DEFAULT_FILE}: expected a line `provider = "NAME"`')
+    return m.group(1)
+
+
+def daemon_get(path: str, timeout: float = 10.0) -> tuple[int, str]:
+    req = urllib.request.Request(DAEMON_BASE + path, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+
+
+def daemon_post(path: str, body: dict, timeout: float = 30.0) -> tuple[int, str]:
+    data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(
+        DAEMON_BASE + path,
+        method="POST",
+        headers={"Content-Type": "application/json"},
+        data=data,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status, resp.read().decode("utf-8")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", errors="replace")
+
+
+def daemon_alive() -> bool:
+    try:
+        # /health is the unauthenticated upstream endpoint; works regardless
+        # of how Providers[] is configured.
+        with urllib.request.urlopen(DAEMON_BASE + "/health", timeout=2) as resp:
+            return resp.status == 200
+    except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, OSError):
+        return False
+
+
+def ensure_daemon_running() -> None:
+    """Per-user mode only: start the daemon if it isn't already running.
+    System mode is handled by systemd at boot; this function is a no-op
+    there."""
+    if SYSTEM_MODE:
+        if not daemon_alive():
+            die(
+                "daemon not reachable at "
+                + DAEMON_BASE
+                + " (systemctl status code-router.service)"
+            )
+        return
+
+    if daemon_alive():
+        return
+
+    ccr = shutil.which("ccr")
+    if not ccr:
+        die("ccr not on PATH -- make sure Node 20+ is installed and `npm i -g` works")
+
+    # Set the env the daemon will inherit. Per-user systemd timer's
+    # code-router.service sets these for the timer-driven refresh; we set the
+    # same ones here so the on-demand daemon spawn picks them up too.
+    env = os.environ.copy()
+    ca = HOME / ".local" / "share" / "ca-certs" / "code-router-ca.pem"
+    if ca.is_file():
+        env.setdefault("NODE_EXTRA_CA_CERTS", str(ca))
+    env.setdefault(
+        "ANTHROPIC_TOKEN_DIR", str(HOME / ".claude-code-router" / "tokens")
+    )
+    env.setdefault("ICODE_CFG", str(ICODE_CFG))
+    env.setdefault(
+        "CODE_ROUTER_DIR", str(HOME / ".claude-code-router")
+    )
+
+    # Detach so we don't keep a handle on the daemon process. `ccr start`
+    # itself daemonizes; we just need to spawn-and-forget.
+    subprocess.Popen(
+        [ccr, "start"],
+        env=env,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        start_new_session=True,
+    )
+
+    # Wait up to ~10s for the daemon to bind its port.
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if daemon_alive():
+            return
+        time.sleep(0.2)
+    die(
+        "daemon failed to start within 10s -- try `ccr start` manually and "
+        "check ~/.claude-code-router/claude-code-router.log"
+    )
+
+
+def prime_provider(name: str) -> None:
+    status, body = daemon_post("/__admin/prime", {"provider": name}, timeout=30)
+    if status >= 400:
+        # The daemon emits structured errors; just relay the message.
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)
+        except json.JSONDecodeError:
+            msg = body
+        die(f"prime failed for '{name}': {msg}")
+
+
+def lookup_model(name: str) -> str:
+    status, body = daemon_get(f"/__admin/model?provider={urllib.parse.quote(name)}")
+    if status >= 400:
+        try:
+            msg = json.loads(body).get("error", {}).get("message", body)
+        except json.JSONDecodeError:
+            msg = body
+        die(f"model lookup failed for '{name}': {msg}")
+    return body.strip()
+
+
+def cmd_list() -> None:
+    """Pretty-print the configured providers. Falls back to a direct config
+    read if the daemon isn't reachable -- handy for diagnosing setup."""
+    if daemon_alive():
+        status, body = daemon_get("/__admin/providers")
+        if status >= 400:
+            die(f"daemon refused /__admin/providers: HTTP {status}")
+        data = json.loads(body)
+        rows = data.get("providers", [])
+    else:
+        try:
+            cfg = json.loads(ICODE_CFG.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            die(f"{ICODE_CFG}: {e}")
+        rows = [
+            {"name": p["name"], "type": p.get("type", "openai"), "model": p["model"]}
+            for p in cfg.get("providers", [])
+        ]
+    if not rows:
+        return
+    width = max(len(r["name"]) for r in rows)
+    for r in rows:
+        print(f"{r['name']:<{width}}  {r['type']:<9}  {r['model']}")
+
+
+# ---- main -----------------------------------------------------------------
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="icode",
+        description=(
+            "Run claude-code through the local code-router daemon, "
+            "routing this session to a chosen provider."
+        ),
+        add_help=False,
+    )
+    parser.add_argument("--provider", metavar="NAME")
+    parser.add_argument("--list", action="store_true")
+    parser.add_argument("--safe", action="store_true")
+    # Everything else is forwarded to claude-code.
+    args, forward = parser.parse_known_args()
+
+    if args.list:
+        cmd_list()
+        return
+
+    ensure_daemon_running()
+
+    provider = args.provider or read_default_provider()
+    if not provider:
+        die(
+            "no default configured and no provider specified\n"
+            f"  set {DEFAULT_FILE} (provider = \"NAME\") or pass --provider NAME",
+            code=2,
+        )
+
+    prime_provider(provider)
+    model = lookup_model(provider)
+
+    # Env that points claude-code at the local daemon. Mirrors what `ccr code`
+    # would have done, but we exec claude directly to avoid the
+    # isServiceRunning() check, which looks at the calling user's pid file
+    # (wrong location in system mode, fragile in per-user mode).
+    os.environ["ANTHROPIC_BASE_URL"] = DAEMON_BASE
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = "test"  # daemon ignores; auth is in-daemon
+    os.environ["NO_PROXY"] = "127.0.0.1"
+    os.environ["DISABLE_TELEMETRY"] = "true"
+    os.environ["DISABLE_COST_WARNINGS"] = "true"
+    os.environ.setdefault("API_TIMEOUT_MS", "600000")
+    # Bump Read tool's per-call cap from 25k to 128k so large MCP results
+    # (e.g. multi-sheet xlsx dumps) don't blow up ingestion.
+    os.environ.setdefault("CLAUDE_CODE_FILE_READ_MAX_OUTPUT_TOKENS", "128000")
+    os.environ.pop("CLAUDE_CODE_USE_BEDROCK", None)
+
+    skip_perms = []
+    if not args.safe and os.geteuid() != 0:
+        # claude-code refuses --dangerously-skip-permissions when running as
+        # root or under sudo.
+        skip_perms = ["--dangerously-skip-permissions"]
+
+    claude = shutil.which("claude")
+    if not claude:
+        die("claude not on PATH (is @anthropic-ai/claude-code installed?)")
+
+    argv = [claude, "--model", f"{provider},{model}", *skip_perms, *forward]
+    os.execvp(claude, argv)
+
+
+if __name__ == "__main__":
+    main()

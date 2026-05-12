@@ -1,8 +1,11 @@
-# Patched fork of claude-code-router
+# Router (router/) — change history
 
-This directory is a snapshot of `https://github.com/musistudio/claude-code-router`
-with three local patches applied. The patches live baked into the source —
-there is no `.patch` file to apply and no upstream clone at install time.
+This directory is our own fork. It started life as a snapshot of
+`https://github.com/musistudio/claude-code-router`, but we've made enough
+local changes that it should be treated as first-party code: refactor
+freely, no "upstream-divergence cost" to weigh. This file documents the
+notable patches that motivated the divergence, for archaeology purposes.
+The changes are baked into the source — no `.patch` files to apply.
 
 ## Patch 1 — `packages/cli/src/utils/index.ts` :: `restartService()`
 
@@ -96,36 +99,32 @@ single-element `["Anthropic"]` chain → CCR bypass mode → only `auth()` runs)
 
 In `auth()`, before building headers and returning:
 
-1. If `process.env.ANTHROPIC_TOKEN_FILE` is set, read the live bearer token
-   from that file (defaulting back to `provider.apiKey` on read error).
-   Pairs with `code-router-refresh-token`, which atomically rewrites the
-   token file every 30 min.
-2. Strip `request.context_management` and `request.thinking` (gateway has
+1. **Resolve the active token path.** Preferred: when
+   `process.env.ANTHROPIC_TOKEN_DIR` is set, use
+   `${ANTHROPIC_TOKEN_DIR}/${provider.name}.txt` — this lets the single
+   daemon serve multiple Anthropic-typed providers concurrently, each with
+   its own rotating bearer token, keyed off the provider name CCR resolved
+   from the inbound `model = "name,model"` field. Legacy fallback: when
+   only `process.env.ANTHROPIC_TOKEN_FILE` is set, use that single file
+   (matches the old single-active-provider behavior). With neither set,
+   patch 3 is inert and behavior matches upstream.
+2. Read the live bearer token from the resolved path (falling back to
+   `provider.apiKey` on read error). Pairs with `code-router-refresh-token`,
+   which atomically rewrites the token files for the warm set every ~30 min.
+3. In DIR mode, also touch `${ANTHROPIC_TOKEN_DIR}/../used/${provider.name}`
+   on each request. The refresh script reads these mtimes to decide which
+   providers are still "warm" and worth re-minting (2h idle TTL); providers
+   that fall out of the window are GC'd, so unused configured providers
+   don't keep consuming token-mint traffic.
+4. Strip `request.context_management` and `request.thinking` (gateway has
    no compatible shape for either).
-3. Clamp `request.reasoning_effort`, `request.reasoning.effort`, and
+5. Clamp `request.reasoning_effort`, `request.reasoning.effort`, and
    `request.output_config.effort` from any unsupported value (e.g.
    `"xhigh"`) down to `"high"` — preserves user intent rather than
    dropping the field.
 
-The patch is gated entirely on `ANTHROPIC_TOKEN_FILE`: if the env var is
-unset, behavior matches upstream. So this patch is safe even if the
-vendored router is reused for non-code-router setups.
+The patch is gated on `ANTHROPIC_TOKEN_DIR` or `ANTHROPIC_TOKEN_FILE`. If
+neither env var is set, behavior matches what the transformer would do
+without the patch — so this code is safe to reuse for non-code-router
+setups that don't want the OAuth-rotation machinery.
 
-## Why vendor instead of patch-on-install
-
-- Zero install-time network dependency on github.com.
-- Reproducible build: every install of this project ships the same source.
-- No upstream-drift risk between when the patch was authored and when an
-  install runs.
-- Trivial to diff against upstream when re-syncing.
-
-## Re-syncing with upstream
-
-```bash
-git clone https://github.com/musistudio/claude-code-router.git /tmp/ccr-upstream
-diff -ru /tmp/ccr-upstream/packages/cli/src/utils/index.ts \
-         router/packages/cli/src/utils/index.ts
-```
-
-If upstream merges the fix, drop the local change and pull the new
-sources straight in.

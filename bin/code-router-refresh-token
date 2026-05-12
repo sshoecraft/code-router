@@ -1,85 +1,89 @@
 #!/usr/bin/env python3
-"""code-router-refresh-token -- mint a fresh OAuth bearer token for the
-active provider and atomically write it to ~/.claude-code-router/token.txt.
+"""code-router-refresh-token -- maintain per-provider OAuth tokens for the
+"warm" set of icode providers.
 
-Two provider flavors are supported:
+Layout (paths env-driven; defaults shown):
+  ICODE_CFG               $HOME/.config/icode/config.json   provider list (source of truth)
+  ICODE_CFG_DIR/default.toml                                names the default provider,
+                                                              format: provider = "name"
+  CCR_DIR                 $HOME/.claude-code-router/        CCR daemon state
+    config.json                                             CCR daemon config (Providers[],Router)
+    tokens/<n>.txt                                          per-provider OAuth bearer token
+    used/<n>                                                zero-byte marker; mtime = last use
 
-  type = "openai"     OpenAI-compatible chat-completions gateway. Routed
-                      through CCR; the inject-token plugin reads token.txt
-                      per request and rewrites the Authorization header.
+Modes:
+  no args                  refresh every "warm" provider, GC stale ones.
+                           warm = {default} ∪ {p : used/p mtime within IDLE_TTL_SEC}
+  --provider NAME          prime: mint NAME's token, touch used/NAME. Does not
+                           mutate any other provider's token or any default.
+                           Called by icode at session launch.
+  --print-model NAME       print the configured model for NAME (used by icode)
+  --list                   list configured providers
 
-  type = "anthropic"  Anthropic-native Messages API gateway. Routed through
-                      CCR using the patched Anthropic transformer, which
-                      reads token.txt per request (gated on
-                      ANTHROPIC_TOKEN_FILE) and strips/clamps body fields
-                      the gateway's older API rejects.
-
-Either way, this script writes the active provider's bearer token to
-~/.claude-code-router/token.txt. The active provider's name lives in
-~/.claude-code-router/active-provider so the timer-driven no-arg refresh
-preserves the user's --provider choice.
-
-Usage:
-  code-router-refresh-token                  refresh active provider
-  code-router-refresh-token --provider NAME  switch active provider + refresh
-  code-router-refresh-token --list           list configured providers
-
-Active provider selection (in priority order):
-  1. --provider NAME flag
-  2. ~/.claude-code-router/active-provider file
-  3. name parsed from Router.default in the existing CCR config
-  4. first provider in the icode config
-
-Source-of-truth credentials live in ~/.config/icode/config.json. Override
-with ICODE_CFG=/path/to/config.json in the environment. The schema is:
-
-  {
-    "providers": [
-      {
-        "name":            "azprod",
-        "type":            "openai",         // or "anthropic"; default "openai"
-        "client_id":       "...",
-        "client_secret":   "...",
-        "token_url":       "https://.../oauth2/.../v1/token",
-        "token_scope":     "...",
-        "base_url":        "https://gateway.example.com/...",
-        "deployment_name": "...",            // openai only
-        "api_version":     "2024-06-01",     // openai only
-        "model":           "..."
-      }
-    ]
-  }
-
-This script is pure-stdlib Python 3; no external packages required.
+The single CCR daemon serves multiple providers concurrently via per-request
+"provider,model" routing. inject-token.js and the patched Anthropic transformer
+each read tokens/<provider.name>.txt per request and touch used/<provider.name>
+so the timer keeps the active set warm without operator action.
 """
 
 import argparse
 import base64
 import json
 import os
+import pwd
+import re
 import ssl
 import sys
 import tempfile
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
 
-# Paths are env-var-driven so the same script serves both per-user installs
-# (defaults below) and system installs (the systemd unit sets the env vars
-# to point at /etc/icode, /var/lib/code-router, /usr/local/share/...).
+# Self-configure for system mode. When invoked as user `code-router` (the
+# systemd unit or icode-in-system-mode via NOPASSWD sudo), default paths to
+# the system install locations rather than $HOME-relative ones. Explicit env
+# vars still win. Per-user invocations are unaffected.
+try:
+    if pwd.getpwuid(os.geteuid()).pw_name == "code-router":
+        _SYS_BASE = "/var/lib/code-router"
+        os.environ.setdefault("ICODE_CFG", "/etc/icode/config.json")
+        os.environ.setdefault("CODE_ROUTER_DIR", f"{_SYS_BASE}/.claude-code-router")
+        os.environ.setdefault("CODE_ROUTER_PLUGIN_DIR", "/usr/local/share/code-router/plugins")
+        os.environ.setdefault("CODE_ROUTER_CA_FILE", "/usr/local/share/code-router/ca.pem")
+except KeyError:
+    pass
+
 HOME = Path.home()
 ICODE_CFG = Path(os.environ.get("ICODE_CFG", HOME / ".config" / "icode" / "config.json"))
+ICODE_CFG_DIR = ICODE_CFG.parent
+DEFAULT_FILE = ICODE_CFG_DIR / "default.toml"
+
 CCR_DIR = Path(os.environ.get("CODE_ROUTER_DIR", HOME / ".claude-code-router"))
 CCR_CFG = CCR_DIR / "config.json"
-TOKEN_FILE = CCR_DIR / "token.txt"
-ACTIVE_FILE = CCR_DIR / "active-provider"
+TOKENS_DIR = CCR_DIR / "tokens"
+USED_DIR = CCR_DIR / "used"
+LEGACY_TOKEN_FILE = CCR_DIR / "token.txt"
+LEGACY_ACTIVE_FILE = CCR_DIR / "active-provider"
+
 CA_FILE = Path(os.environ.get(
     "CODE_ROUTER_CA_FILE",
     HOME / ".local" / "share" / "ca-certs" / "code-router-ca.pem",
 ))
 PLUGIN_DIR = Path(os.environ.get("CODE_ROUTER_PLUGIN_DIR", CCR_DIR / "plugins"))
+
 SUPPORTED_TYPES = ("openai", "anthropic")
+IDLE_TTL_SEC = 2 * 3600  # warm window: 2h since last use
+
+# Single line: provider = "name". Anything beyond that is ignored so the file
+# stays trivially editable by hand.
+DEFAULT_RE = re.compile(r'^\s*provider\s*=\s*"([^"]+)"\s*(?:#.*)?$', re.MULTILINE)
+
+
+class MintError(Exception):
+    """Raised by mint_token on any non-recoverable mint failure. Callers
+    decide whether to die (prime mode) or continue (warm-set refresh)."""
 
 
 def die(msg, code=1):
@@ -88,8 +92,6 @@ def die(msg, code=1):
 
 
 def atomic_write(path: Path, content: str, mode: int = 0o600) -> None:
-    """Write content to path via tempfile + rename so readers never see a
-    half-written file."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=str(path.parent))
     try:
@@ -116,14 +118,16 @@ def load_config() -> list:
             cfg = json.load(f)
     except json.JSONDecodeError as e:
         die(f"{ICODE_CFG}: invalid JSON: {e}")
-
     providers = cfg.get("providers")
     if not isinstance(providers, list) or not providers:
         die(f"{ICODE_CFG} must define a non-empty 'providers' array")
-
+    seen = set()
     for p in providers:
         if not isinstance(p, dict) or not p.get("name"):
             die(f"{ICODE_CFG}: each provider entry must be an object with a 'name'")
+        if p["name"] in seen:
+            die(f"{ICODE_CFG}: duplicate provider name '{p['name']}'")
+        seen.add(p["name"])
         t = p.get("type", "openai")
         if t not in SUPPORTED_TYPES:
             die(
@@ -133,32 +137,25 @@ def load_config() -> list:
     return providers
 
 
-def resolve_active(providers: list, requested: str | None) -> str:
-    names = [p["name"] for p in providers]
-    if requested:
-        active = requested
-    else:
-        active = ""
-        try:
-            active = ACTIVE_FILE.read_text().strip()
-        except FileNotFoundError:
-            pass
-        if not active and CCR_CFG.is_file():
-            try:
-                with open(CCR_CFG) as f:
-                    rd = (json.load(f).get("Router") or {}).get("default", "")
-                active = rd.split(",", 1)[0] if rd else ""
-            except json.JSONDecodeError:
-                pass
-        if not active:
-            active = names[0]
-
-    if active not in names:
+def read_default(names: set) -> str | None:
+    """Return the default provider name from default.toml, or None if no
+    default file exists. Validates membership against the current config."""
+    if not DEFAULT_FILE.is_file():
+        return None
+    try:
+        text = DEFAULT_FILE.read_text()
+    except OSError as e:
+        die(f"{DEFAULT_FILE}: {e}")
+    m = DEFAULT_RE.search(text)
+    if not m:
+        die(f"{DEFAULT_FILE}: expected a line `provider = \"NAME\"`")
+    name = m.group(1)
+    if name not in names:
         die(
-            f"provider '{active}' not found in {ICODE_CFG}\n"
-            f"  available: {' '.join(names)}"
+            f"{DEFAULT_FILE}: default provider '{name}' is not in {ICODE_CFG}\n"
+            f"  available: {' '.join(sorted(names))}"
         )
-    return active
+    return name
 
 
 def required_fields(p_type: str) -> set:
@@ -169,13 +166,11 @@ def required_fields(p_type: str) -> set:
 
 
 def mint_token(p: dict) -> tuple[str, object]:
-    """Mint a fresh OAuth client_credentials bearer token. Mirrors
-    `curl -u id:secret -d grant_type=...&scope=...` with the corporate CA
-    bundle when available."""
+    """OAuth client_credentials mint. Raises MintError on failure (callers
+    decide whether to die or continue past it)."""
     body = urllib.parse.urlencode(
         {"grant_type": "client_credentials", "scope": p.get("token_scope", "")}
     ).encode()
-
     creds = f"{p['client_id']}:{p['client_secret']}".encode()
     headers = {
         "Authorization": "Basic " + base64.b64encode(creds).decode(),
@@ -183,11 +178,8 @@ def mint_token(p: dict) -> tuple[str, object]:
     }
     req = urllib.request.Request(p["token_url"], data=body, headers=headers, method="POST")
 
-    # Use system CAs (Okta and other public TLDs) and ALSO trust the
-    # corporate bundle (gateway hosts behind the McKesson root CA). This
-    # mirrors curl's `--cacert FILE`, which keeps the system CApath
-    # alongside the supplied file, while Python's `cafile=` argument would
-    # replace system CAs entirely.
+    # System CAs PLUS the corporate bundle. cafile= would replace system CAs;
+    # load_verify_locations adds to them.
     ctx = ssl.create_default_context()
     if CA_FILE.is_file():
         ctx.load_verify_locations(cafile=str(CA_FILE))
@@ -197,21 +189,17 @@ def mint_token(p: dict) -> tuple[str, object]:
             payload = json.loads(resp.read())
     except urllib.error.HTTPError as e:
         body = e.read().decode(errors="replace")
-        die(f"token mint failed for provider '{p['name']}': HTTP {e.code}\n{body}")
+        raise MintError(f"HTTP {e.code}\n{body}")
     except urllib.error.URLError as e:
-        die(f"token mint failed for provider '{p['name']}': {e.reason}")
+        raise MintError(str(e.reason))
 
     token = payload.get("access_token") if isinstance(payload, dict) else None
     if not token:
-        die(
-            f"token mint failed for provider '{p['name']}':\n"
-            f"{json.dumps(payload, indent=2)}"
-        )
+        raise MintError(f"unexpected response:\n{json.dumps(payload, indent=2)}")
     return token, payload.get("expires_in", "?")
 
 
 def build_ccr_provider(p: dict) -> dict:
-    """Build a CCR Providers[] entry for one icode provider."""
     p_type = p.get("type", "openai")
     if p_type == "openai":
         url = (
@@ -230,23 +218,25 @@ def build_ccr_provider(p: dict) -> dict:
                 "use": ["openai", "strip-reasoning", "maxcompletiontokens", "inject-token"]
             },
         }
-    # anthropic
     return {
         "name": p["name"],
         "api_base_url": p["base_url"] + "/v1/messages",
-        "api_key": "PLACEHOLDER_OVERRIDDEN_BY_TOKEN_FILE",
+        "api_key": "PLACEHOLDER_OVERRIDDEN_BY_TOKEN_DIR",
         "models": [p["model"]],
         "transformer": {"use": ["Anthropic"]},
     }
 
 
-def update_ccr_config(
-    providers: list, active: str, active_model: str, requested: str | None
-) -> bool:
-    """Bootstrap or in-place-update the CCR config. Returns True if a fresh
-    bootstrap was written."""
+def update_ccr_config(providers: list, default_name: str | None) -> bool:
+    """Rebuild Providers[] and Router.default. Returns True if a fresh bootstrap
+    was written (vs an in-place update of an existing config)."""
     new_providers = [build_ccr_provider(p) for p in providers]
-    router_default = f"{active},{active_model}"
+    # Router.default is a fallback for requests that arrive without a model
+    # arg. icode always passes --model, so this is mostly defensive. If no
+    # default.toml exists, fall back to the first configured provider.
+    d_name = default_name if default_name else providers[0]["name"]
+    d = next(p for p in providers if p["name"] == d_name)
+    router_default = f"{d['name']},{d['model']}"
 
     plugin_strip = str(PLUGIN_DIR / "strip-reasoning.js")
     plugin_inject = str(PLUGIN_DIR / "inject-token.js")
@@ -259,11 +249,9 @@ def update_ccr_config(
         except json.JSONDecodeError:
             existing = None
 
-    # Treat missing or stale (no inject-token plugin) configs as needing bootstrap.
     need_bootstrap = existing is None or "inject-token" not in json.dumps(
         existing.get("transformers", [])
     )
-
     if need_bootstrap:
         cfg = {
             "LOG": False,
@@ -278,13 +266,61 @@ def update_ccr_config(
     else:
         cfg = existing
         cfg["Providers"] = new_providers
-        # Update Router.default only when the user explicitly switched, so
-        # the timer-driven no-arg refresh preserves the active selection.
-        if requested:
-            cfg.setdefault("Router", {})["default"] = router_default
+        cfg.setdefault("Router", {})["default"] = router_default
 
     atomic_write(CCR_CFG, json.dumps(cfg, indent=2) + "\n", mode=0o600)
     return need_bootstrap
+
+
+def touch_used(name: str) -> None:
+    """Create the per-provider marker if missing, then bump its mtime to now.
+    Plugin code also touches this on each request; we touch it here so the
+    very next timer tick sees the provider as warm."""
+    USED_DIR.mkdir(parents=True, exist_ok=True)
+    p = USED_DIR / name
+    if not p.exists():
+        with open(p, "a"):
+            pass
+        os.chmod(p, 0o600)
+    os.utime(p, None)
+
+
+def write_token(name: str, token: str) -> None:
+    TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+    atomic_write(TOKENS_DIR / f"{name}.txt", token + "\n", mode=0o600)
+
+
+def maybe_migrate() -> None:
+    """One-shot migration from the legacy single-token layout. After this runs
+    once, the legacy files are gone and subsequent invocations are no-ops."""
+    if TOKENS_DIR.exists() or not LEGACY_TOKEN_FILE.is_file():
+        return
+    active = None
+    if LEGACY_ACTIVE_FILE.is_file():
+        try:
+            active = LEGACY_ACTIVE_FILE.read_text().strip() or None
+        except OSError:
+            active = None
+    if active:
+        try:
+            content = LEGACY_TOKEN_FILE.read_text()
+        except OSError:
+            content = None
+        if content:
+            TOKENS_DIR.mkdir(parents=True, exist_ok=True)
+            atomic_write(TOKENS_DIR / f"{active}.txt", content, mode=0o600)
+            touch_used(active)
+            print(
+                f"code-router: migrated legacy token -> tokens/{active}.txt",
+                file=sys.stderr,
+            )
+    # Clean up legacy files regardless: if we couldn't preserve, the next
+    # prime call will mint fresh.
+    for f in (LEGACY_TOKEN_FILE, LEGACY_ACTIVE_FILE):
+        try:
+            f.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def cmd_list(providers: list) -> None:
@@ -293,43 +329,128 @@ def cmd_list(providers: list) -> None:
         print(f"{p['name']:<{width}}  {p.get('type', 'openai')}")
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(
-        prog="code-router-refresh-token",
-        description="Mint OAuth tokens for icode providers; maintain CCR config.",
-    )
-    parser.add_argument("--provider", help="switch active provider, then refresh")
-    parser.add_argument(
-        "--list", action="store_true", help="list configured providers and exit"
-    )
-    args = parser.parse_args()
+def cmd_print_model(providers: list, name: str) -> None:
+    for p in providers:
+        if p["name"] == name:
+            print(p["model"])
+            return
+    die(f"provider '{name}' not found in {ICODE_CFG}", code=2)
 
-    providers = load_config()
 
-    if args.list:
-        cmd_list(providers)
-        return
-
-    active = resolve_active(providers, args.provider)
-    p = next(x for x in providers if x["name"] == active)
+def cmd_prime(providers: list, name: str) -> None:
+    p = next((x for x in providers if x["name"] == name), None)
+    if p is None:
+        die(f"provider '{name}' not found in {ICODE_CFG}")
     p_type = p.get("type", "openai")
-
     missing = sorted(k for k in required_fields(p_type) if not p.get(k))
     if missing:
         die(
-            f"provider '{active}' (type={p_type}) is missing required field(s): "
+            f"provider '{name}' (type={p_type}) is missing required field(s): "
             + ", ".join(missing)
         )
+    try:
+        token, expires_in = mint_token(p)
+    except MintError as e:
+        die(f"token mint failed for provider '{name}': {e}")
+    write_token(name, token)
+    touch_used(name)
+    # Keep Providers[] in sync in case config changed since the daemon started.
+    update_ccr_config(providers, read_default({q["name"] for q in providers}))
+    print(
+        f"code-router: token primed for '{name}' "
+        f"(type: {p_type}, expires in {expires_in}s)"
+    )
 
-    token, expires_in = mint_token(p)
 
-    atomic_write(TOKEN_FILE, token + "\n", mode=0o600)
-    atomic_write(ACTIVE_FILE, active + "\n", mode=0o600)
+def cmd_refresh(providers: list, default_name: str | None) -> None:
+    """Timer-driven: refresh the warm set, GC the rest."""
+    names = {p["name"] for p in providers}
+    now = time.time()
+    warm = set()
+    if default_name and default_name in names:
+        warm.add(default_name)
+    if USED_DIR.is_dir():
+        for marker in USED_DIR.iterdir():
+            if marker.name in names:
+                try:
+                    if now - marker.stat().st_mtime < IDLE_TTL_SEC:
+                        warm.add(marker.name)
+                except FileNotFoundError:
+                    pass
 
-    bootstrapped = update_ccr_config(providers, active, p["model"], args.provider)
-    if bootstrapped:
-        print(f"code-router: wrote config -> {CCR_CFG} (active: {active}, type: {p_type})")
-    print(f"code-router: token refreshed for '{active}' (type: {p_type}, expires in {expires_in}s)")
+    refreshed, errors = [], []
+    for name in sorted(warm):
+        p = next(x for x in providers if x["name"] == name)
+        miss = sorted(k for k in required_fields(p.get("type", "openai")) if not p.get(k))
+        if miss:
+            errors.append((name, "missing fields: " + ", ".join(miss)))
+            continue
+        try:
+            token, _ = mint_token(p)
+        except MintError as e:
+            errors.append((name, f"mint failed: {e}"))
+            continue
+        write_token(name, token)
+        refreshed.append(name)
+
+    # GC: anything in tokens/ or used/ outside the warm set, including names
+    # that are no longer in the icode config.
+    if TOKENS_DIR.is_dir():
+        for f in TOKENS_DIR.iterdir():
+            if f.suffix == ".txt" and f.stem not in warm:
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+    if USED_DIR.is_dir():
+        for f in USED_DIR.iterdir():
+            if f.name not in warm:
+                try:
+                    f.unlink()
+                except FileNotFoundError:
+                    pass
+
+    update_ccr_config(providers, default_name)
+
+    if refreshed:
+        print(f"code-router: refreshed [{' '.join(refreshed)}]")
+    elif not warm:
+        print("code-router: no warm providers; nothing to refresh")
+    for name, reason in errors:
+        print(f"code-router: refresh skipped '{name}': {reason}", file=sys.stderr)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        prog="code-router-refresh-token",
+        description="Mint per-provider OAuth tokens for icode; maintain CCR config.",
+    )
+    g = parser.add_mutually_exclusive_group()
+    g.add_argument("--provider", metavar="NAME", help="prime NAME's token and exit")
+    g.add_argument(
+        "--print-model",
+        metavar="NAME",
+        dest="print_model",
+        help="print NAME's configured model and exit",
+    )
+    g.add_argument("--list", action="store_true", help="list configured providers")
+    args = parser.parse_args()
+
+    providers = load_config()
+    if args.list:
+        cmd_list(providers)
+        return
+    if args.print_model:
+        cmd_print_model(providers, args.print_model)
+        return
+
+    maybe_migrate()
+
+    if args.provider:
+        cmd_prime(providers, args.provider)
+        return
+
+    cmd_refresh(providers, read_default({p["name"] for p in providers}))
 
 
 if __name__ == "__main__":

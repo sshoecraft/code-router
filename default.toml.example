@@ -1,0 +1,10 @@
+# icode default provider.
+#
+# Names the provider that `icode` (with no --provider flag) routes to.
+# Must match a `name` from $ICODE_CFG (config.json next to this file).
+#
+# When this file is absent and no --provider is passed on the command line,
+# icode errors out rather than guessing. To use multiple providers in the
+# same install without changing the default, leave this file alone and pass
+# `icode --provider NAME` per session.
+provider = "azprod"

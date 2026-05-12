@@ -20,6 +20,8 @@
   "devDependencies": {
     "@CCR/server": "workspace:*",
     "@CCR/shared": "workspace:*",
+    "@inquirer/confirm": "^3.0.0",
+    "@inquirer/input": "^2.0.0",
     "@inquirer/prompts": "^5.0.0",
     "@types/archiver": "^7.0.0",
     "@types/node": "^24.0.15",
@@ -27,8 +29,10 @@
     "archiver": "^7.0.1",
     "esbuild": "^0.25.1",
     "find-process": "^2.0.0",
+    "json5": "^2.2.0",
     "minimist": "^1.2.8",
     "openurl": "^1.1.1",
+    "shell-quote": "^1.8.0",
     "ts-node": "^10.9.2",
     "typescript": "^5.8.2"
   }

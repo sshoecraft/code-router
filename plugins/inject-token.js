@@ -1,49 +1,73 @@
 // inject-token.js
 //
-// Reads a fresh OAuth bearer token from disk per request and injects it into
-// the outbound `Authorization` header. Pairs with code-router-refresh-token,
-// which writes the token to TOKEN_FILE every ~30 minutes.
+// Reads the active provider's OAuth bearer token from disk per request and
+// injects it into the outbound Authorization header. Pairs with
+// code-router-refresh-token, which writes tokens/<provider>.txt every ~30 min
+// for every "warm" provider in the active set.
 //
-// Goal: tokens rotate without restarting the CCR daemon. In-flight sessions
-// keep working; concurrent sessions share the same daemon. The previous
-// design (rewrite config + `ccr restart`) killed any in-flight requests.
+// Goal: the single CCR daemon serves multiple providers concurrently. Each
+// request carries `provider.name` (set by CCR's router based on the incoming
+// `model = "name,model"` field), and we look up tokens/<name>.txt for that
+// provider. Touching used/<name> on every call signals the timer that this
+// provider is still in use, so its token keeps getting refreshed.
 //
-// Reads are cached for 5 seconds in-process to avoid hitting the filesystem
-// on every single request while still picking up rotated tokens promptly.
+// 5s in-process cache per provider so we don't hit the filesystem on every
+// single request, while still picking up rotated tokens promptly.
 
 const fs = require("fs");
 const path = require("path");
 const os = require("os");
 
-const TOKEN_FILE = path.join(os.homedir(), ".claude-code-router", "token.txt");
+const ROOT = path.join(os.homedir(), ".claude-code-router");
+const TOKENS_DIR = path.join(ROOT, "tokens");
+const USED_DIR = path.join(ROOT, "used");
 const CACHE_TTL_MS = 5000;
 
-let cached = { token: "", readAt: 0 };
+// keyed by provider.name -> { token, readAt }
+const cache = new Map();
 
-function getToken() {
+function readToken(name) {
   const now = Date.now();
-  if (cached.token && now - cached.readAt < CACHE_TTL_MS) {
-    return cached.token;
-  }
+  const hit = cache.get(name);
+  if (hit && now - hit.readAt < CACHE_TTL_MS) return hit.token;
   try {
-    const t = fs.readFileSync(TOKEN_FILE, "utf8").trim();
+    const t = fs.readFileSync(path.join(TOKENS_DIR, `${name}.txt`), "utf8").trim();
     if (t) {
-      cached = { token: t, readAt: now };
+      cache.set(name, { token: t, readAt: now });
       return t;
     }
-  } catch (e) {
-    // Fall through to whatever we have cached; if nothing, return empty
-    // and let the upstream reject with 401 -- that's a clearer signal than
-    // silently sending a stale or missing token.
+  } catch (_) {
+    // Token file missing or unreadable -- fall through to whatever we have
+    // cached (possibly nothing). Empty header lets the upstream 401, which is
+    // a clearer signal than silently sending stale or no auth.
   }
-  return cached.token;
+  return hit ? hit.token : "";
+}
+
+function touchUsed(name) {
+  const p = path.join(USED_DIR, name);
+  try {
+    const now = new Date();
+    fs.utimesSync(p, now, now);
+  } catch (_) {
+    // Marker missing -- create it.
+    try {
+      fs.mkdirSync(USED_DIR, { recursive: true });
+      fs.closeSync(fs.openSync(p, "a"));
+    } catch (_) {
+      // Read-only FS or perms issue. Not fatal; the worst case is that the
+      // timer doesn't see this provider as warm and lets its token expire.
+    }
+  }
 }
 
 class InjectToken {
   name = "inject-token";
 
   async transformRequestIn(request, provider) {
-    const token = getToken();
+    const pname = provider && provider.name ? provider.name : "";
+    const token = pname ? readToken(pname) : "";
+    if (pname) touchUsed(pname);
     return {
       body: request,
       config: {

@@ -26,17 +26,28 @@ export class AnthropicTransformer implements Transformer {
   }
 
   async auth(request: any, provider: LLMProvider): Promise<any> {
-    // code-router patch: when ANTHROPIC_TOKEN_FILE is set, read a freshly
-    // rotated bearer token from disk per request (paired with the user-side
-    // token-refresh timer). This lets the daemon stay up across rotations.
+    // code-router patch: when ANTHROPIC_TOKEN_DIR is set, look up the bearer
+    // token for THIS request's provider at <dir>/<provider.name>.txt and touch
+    // <dir>/../used/<provider.name> so the user-side timer keeps it warm. This
+    // lets the daemon serve multiple Anthropic-typed providers concurrently
+    // without restart. Falls back to single-file ANTHROPIC_TOKEN_FILE for
+    // legacy setups. With neither env set, behavior matches upstream.
     let apiKey = provider.apiKey;
     let useBearer = this.useBearer;
+    const tokenDir = process.env.ANTHROPIC_TOKEN_DIR;
     const tokenFile = process.env.ANTHROPIC_TOKEN_FILE;
-    if (tokenFile) {
+    let activeTokenPath: string | undefined;
+    if (tokenDir && provider?.name) {
+      activeTokenPath = `${tokenDir}/${provider.name}.txt`;
+    } else if (tokenFile) {
+      activeTokenPath = tokenFile;
+    }
+    const patchActive = !!activeTokenPath;
+    if (activeTokenPath) {
       try {
         // eslint-disable-next-line @typescript-eslint/no-var-requires
         const fs = require("fs");
-        const t = fs.readFileSync(tokenFile, "utf8").trim();
+        const t = fs.readFileSync(activeTokenPath, "utf8").trim();
         if (t) {
           apiKey = t;
           useBearer = true;
@@ -45,13 +56,38 @@ export class AnthropicTransformer implements Transformer {
         // Fall through to provider.apiKey; upstream will reject with 401,
         // which is a clearer signal than silently sending a stale token.
       }
+      if (tokenDir && provider?.name) {
+        try {
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const fs = require("fs");
+          // eslint-disable-next-line @typescript-eslint/no-var-requires
+          const path = require("path");
+          const usedDir = path.join(tokenDir, "..", "used");
+          const usedFile = path.join(usedDir, provider.name);
+          try {
+            const now = new Date();
+            fs.utimesSync(usedFile, now, now);
+          } catch {
+            try {
+              fs.mkdirSync(usedDir, { recursive: true });
+              fs.closeSync(fs.openSync(usedFile, "a"));
+            } catch {
+              // Read-only FS / perms -- not fatal. Worst case the timer drops
+              // this provider after the idle window and the next request 401s.
+            }
+          }
+        } catch {
+          // Defensive: any unexpected error in the touch path must not break
+          // the request itself.
+        }
+      }
     }
 
     // code-router patch: strip/clamp request fields the corporate Anthropic
-    // gateway's older API rejects. Gated on ANTHROPIC_TOKEN_FILE so
-    // anyone reusing this router against a real Anthropic upstream gets
-    // upstream behavior unchanged.
-    if (tokenFile && request && typeof request === "object") {
+    // gateway's older API rejects. Active whenever the bearer-token override
+    // is active (either DIR or FILE mode). With neither env set, upstream
+    // behavior is preserved unchanged.
+    if (patchActive && request && typeof request === "object") {
       // context_management is a newer Claude Code beta the gateway's older
       // API doesn't accept at all -- no equivalent shape to fall back to,
       // so just drop it.

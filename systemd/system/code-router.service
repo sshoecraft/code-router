@@ -18,9 +18,17 @@ Environment=HOME=/var/lib/code-router
 # Trust the corporate CA bundle when reaching the upstream gateway.
 Environment=NODE_EXTRA_CA_CERTS=/usr/local/share/code-router/ca.pem
 
-# Patched Anthropic transformer reads this path per request so token
-# rotation is invisible to in-flight sessions.
-Environment=ANTHROPIC_TOKEN_FILE=/var/lib/code-router/.claude-code-router/token.txt
+# Patched Anthropic transformer looks up <dir>/<provider.name>.txt per request,
+# so a single daemon serves multiple anthropic-typed providers concurrently.
+# Token rotation is invisible to in-flight sessions.
+Environment=ANTHROPIC_TOKEN_DIR=/var/lib/code-router/.claude-code-router/tokens
+
+# Admin endpoints (POST /__admin/prime, GET /__admin/model, GET /__admin/providers)
+# need to read the icode provider list. ICODE_CFG points at the system config
+# file (root:code-router 0640); CODE_ROUTER_DIR tells the admin handler where
+# to write tokens/<name>.txt.
+Environment=ICODE_CFG=/etc/icode/config.json
+Environment=CODE_ROUTER_DIR=/var/lib/code-router/.claude-code-router
 
 # Resolve `ccr` via PATH instead of hardcoding /usr/local/bin/ccr -- different
 # Node distributions install npm-global binaries to different prefixes
