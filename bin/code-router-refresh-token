@@ -78,7 +78,18 @@ IDLE_TTL_SEC = 2 * 3600  # warm window: 2h since last use
 
 # Single line: provider = "name". Anything beyond that is ignored so the file
 # stays trivially editable by hand.
-DEFAULT_RE = re.compile(r'^\s*provider\s*=\s*"([^"]+)"\s*(?:#.*)?$', re.MULTILINE)
+# Canonical TOML is `provider = "NAME"`, but be lenient with hand-edited
+# files: accept bare (`provider = name`) and single-quoted forms too. Outer
+# matching quote is stripped after capture.
+DEFAULT_RE = re.compile(
+    r'^\s*provider\s*=\s*(.+?)\s*(?:#.*)?$', re.MULTILINE
+)
+
+
+def _strip_quotes(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
 
 
 class MintError(Exception):
@@ -149,7 +160,7 @@ def read_default(names: set) -> str | None:
     m = DEFAULT_RE.search(text)
     if not m:
         die(f"{DEFAULT_FILE}: expected a line `provider = \"NAME\"`")
-    name = m.group(1)
+    name = _strip_quotes(m.group(1).strip())
     if name not in names:
         die(
             f"{DEFAULT_FILE}: default provider '{name}' is not in {ICODE_CFG}\n"

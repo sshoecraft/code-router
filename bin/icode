@@ -75,10 +75,18 @@ def read_default_provider() -> str | None:
     except OSError as e:
         die(f"{DEFAULT_FILE}: {e}")
     import re
-    m = re.search(r'^\s*provider\s*=\s*"([^"]+)"', text, re.MULTILINE)
+    # Canonical TOML is `provider = "NAME"`, but accept bare and
+    # single-quoted forms too so a hand-edited file doesn't trip on
+    # missing quotes.
+    m = re.search(
+        r'^\s*provider\s*=\s*(.+?)\s*(?:#.*)?$', text, re.MULTILINE
+    )
     if not m:
         die(f'{DEFAULT_FILE}: expected a line `provider = "NAME"`')
-    return m.group(1)
+    name = m.group(1).strip()
+    if len(name) >= 2 and name[0] == name[-1] and name[0] in ('"', "'"):
+        name = name[1:-1]
+    return name
 
 
 def daemon_get(path: str, timeout: float = 10.0) -> tuple[int, str]:
