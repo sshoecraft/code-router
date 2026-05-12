@@ -51,9 +51,39 @@ function paths() {
     path.join(os.homedir(), ".claude-code-router");
   return {
     icodeCfg,
+    icodeCfgDir: path.dirname(icodeCfg),
     tokensDir: path.join(ccrDir, "tokens"),
     usedDir: path.join(ccrDir, "used"),
   };
+}
+
+// Canonical TOML is `provider = "NAME"`, but accept bare and single-quoted
+// forms too so a hand-edited file doesn't trip on missing quotes.
+const DEFAULT_RE = /^\s*provider\s*=\s*(.+?)\s*(?:#.*)?$/m;
+
+function readDefaultProvider(): string | null {
+  const { icodeCfgDir } = paths();
+  const file = path.join(icodeCfgDir, "default.toml");
+  let text: string;
+  try {
+    text = fs.readFileSync(file, "utf8");
+  } catch (e: any) {
+    if (e?.code === "ENOENT") return null;
+    throw new Error(`${file}: ${e.message}`);
+  }
+  const m = text.match(DEFAULT_RE);
+  if (!m) {
+    throw new Error(`${file}: expected a line \`provider = "NAME"\``);
+  }
+  let name = m[1].trim();
+  if (
+    name.length >= 2 &&
+    name[0] === name[name.length - 1] &&
+    (name[0] === '"' || name[0] === "'")
+  ) {
+    name = name.slice(1, -1);
+  }
+  return name;
 }
 
 function loadProviders(): IcodeProvider[] {
@@ -260,5 +290,28 @@ export async function registerAdminRoutes(fastify: FastifyInstance) {
         model: p.model,
       })),
     };
+  });
+
+  // Return the default-provider name from <ICODE_CFG_DIR>/default.toml as
+  // plaintext, or 404 if no default file exists. icode uses this instead of
+  // reading the file directly, so an unprivileged caller never needs to
+  // traverse /etc/icode/.
+  fastify.get("/__admin/default", async (req, reply) => {
+    requireLocalhost(req);
+    let name: string | null;
+    try {
+      name = readDefaultProvider();
+    } catch (e: any) {
+      throw createApiError(e.message, 500, "config_error");
+    }
+    if (!name) {
+      throw createApiError(
+        "no default provider configured",
+        404,
+        "no_default"
+      );
+    }
+    reply.type("text/plain");
+    return name;
   });
 }

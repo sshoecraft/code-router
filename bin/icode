@@ -50,13 +50,13 @@ HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 SYSTEM_MODE = str(SCRIPT_DIR) == "/usr/local/bin"
 
-USER_CFG = HOME / ".config" / "icode" / "config.json"
-SYSTEM_CFG = Path("/etc/icode/config.json")
-ICODE_CFG = Path(os.environ.get("ICODE_CFG") or (USER_CFG if USER_CFG.is_file() else SYSTEM_CFG))
-ICODE_CFG_DIR = ICODE_CFG.parent
-DEFAULT_FILE = ICODE_CFG_DIR / "default.toml"
-
 DAEMON_BASE = os.environ.get("CODE_ROUTER_DAEMON_BASE", "http://127.0.0.1:3456")
+
+# Per-user mode only: when we have to spawn the daemon ourselves, we tell it
+# where its icode config lives via ICODE_CFG. icode itself never reads this
+# file -- the daemon does. In system mode the daemon is started by systemd
+# with this env baked into the unit, so this constant is unused there.
+USER_CFG_DEFAULT = HOME / ".config" / "icode" / "config.json"
 
 # ---- helpers --------------------------------------------------------------
 
@@ -64,29 +64,6 @@ DAEMON_BASE = os.environ.get("CODE_ROUTER_DAEMON_BASE", "http://127.0.0.1:3456")
 def die(msg: str, code: int = 1) -> None:
     print(f"icode: {msg}", file=sys.stderr)
     sys.exit(code)
-
-
-def read_default_provider() -> str | None:
-    """Hand-parse default.toml -- one line: provider = "name"."""
-    if not DEFAULT_FILE.is_file():
-        return None
-    try:
-        text = DEFAULT_FILE.read_text()
-    except OSError as e:
-        die(f"{DEFAULT_FILE}: {e}")
-    import re
-    # Canonical TOML is `provider = "NAME"`, but accept bare and
-    # single-quoted forms too so a hand-edited file doesn't trip on
-    # missing quotes.
-    m = re.search(
-        r'^\s*provider\s*=\s*(.+?)\s*(?:#.*)?$', text, re.MULTILINE
-    )
-    if not m:
-        die(f'{DEFAULT_FILE}: expected a line `provider = "NAME"`')
-    name = m.group(1).strip()
-    if len(name) >= 2 and name[0] == name[-1] and name[0] in ('"', "'"):
-        name = name[1:-1]
-    return name
 
 
 def daemon_get(path: str, timeout: float = 10.0) -> tuple[int, str]:
@@ -153,7 +130,7 @@ def ensure_daemon_running() -> None:
     env.setdefault(
         "ANTHROPIC_TOKEN_DIR", str(HOME / ".claude-code-router" / "tokens")
     )
-    env.setdefault("ICODE_CFG", str(ICODE_CFG))
+    env.setdefault("ICODE_CFG", os.environ.get("ICODE_CFG", str(USER_CFG_DEFAULT)))
     env.setdefault(
         "CODE_ROUTER_DIR", str(HOME / ".claude-code-router")
     )
@@ -252,13 +229,24 @@ def main() -> None:
 
     ensure_daemon_running()
 
-    provider = args.provider or read_default_provider()
+    provider = args.provider
     if not provider:
-        die(
-            "no default configured and no provider specified\n"
-            f"  set {DEFAULT_FILE} (provider = \"NAME\") or pass --provider NAME",
-            code=2,
-        )
+        status, body = daemon_get("/__admin/default")
+        if status == 200:
+            provider = body.strip()
+        elif status == 404:
+            die(
+                "no default configured and no provider specified\n"
+                "  set default.toml next to your icode config "
+                "(provider = \"NAME\") or pass --provider NAME",
+                code=2,
+            )
+        else:
+            try:
+                msg = json.loads(body).get("error", {}).get("message", body)
+            except json.JSONDecodeError:
+                msg = body
+            die(f"default lookup failed: {msg}")
 
     prime_provider(provider)
     model = lookup_model(provider)
