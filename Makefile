@@ -277,7 +277,9 @@ install-system-router:
 	@echo "Building the router from $(ROUTER_SRC)..."
 	@cd $(ROUTER_SRC) && pnpm install --silent && pnpm build >/dev/null
 	@echo "Installing globally (system Node)..."
-	@npm i -g $(ROUTER_SRC) >/dev/null
+	@cd $(ROUTER_SRC) && TGZ=$$(npm pack --silent 2>&1 | tail -1) && \
+		npm i -g $$TGZ >/dev/null && \
+		rm -f $$TGZ
 	@echo "claude-code-router installed system-wide."
 	@if ! command -v claude >/dev/null 2>&1; then \
 		echo "Installing Claude Code (@anthropic-ai/claude-code) system-wide..."; \
