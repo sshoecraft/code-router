@@ -8,6 +8,13 @@ export const apiKeyAuth =
     if (publicPaths.includes(req.url) || req.url.startsWith("/ui")) {
       return done();
     }
+    // Admin endpoints enforce their own loopback-only check (requireLocalhost),
+    // so they don't need API-key auth on top — and icode (the local client) has
+    // no way to read the APIKEY in system mode where the daemon config is
+    // root:code-router 0640.
+    if (req.url.startsWith("/__admin")) {
+      return done();
+    }
 
     // Check if Providers is empty or not configured
     const providers = config.Providers || config.providers || [];

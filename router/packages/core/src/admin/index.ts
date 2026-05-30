@@ -292,6 +292,17 @@ export async function registerAdminRoutes(fastify: FastifyInstance) {
     };
   });
 
+  // Return the daemon's configured APIKEY (or empty string if none). icode
+  // uses this to set ANTHROPIC_AUTH_TOKEN before exec'ing claude, so local
+  // sessions keep working after the operator sets APIKEY for network access.
+  // Loopback-only — remote callers can't exfiltrate the key.
+  fastify.get("/__admin/apikey", async (req: any, reply) => {
+    requireLocalhost(req);
+    const apiKey = req.server.configService?.get<string>("APIKEY") ?? "";
+    reply.type("text/plain");
+    return apiKey;
+  });
+
   // Return the default-provider name from <ICODE_CFG_DIR>/default.toml as
   // plaintext, or 404 if no default file exists. icode uses this instead of
   // reading the file directly, so an unprivileged caller never needs to

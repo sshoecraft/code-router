@@ -256,7 +256,11 @@ def main() -> None:
     # isServiceRunning() check, which looks at the calling user's pid file
     # (wrong location in system mode, fragile in per-user mode).
     os.environ["ANTHROPIC_BASE_URL"] = DAEMON_BASE
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = "test"  # daemon ignores; auth is in-daemon
+    # If the daemon has APIKEY set (operator opened network access via HOST),
+    # requests to /v1/messages need it. Fetch via the loopback-only admin
+    # endpoint; falls back to "test" when no key is configured.
+    status, body = daemon_get("/__admin/apikey")
+    os.environ["ANTHROPIC_AUTH_TOKEN"] = body.strip() if status == 200 and body.strip() else "test"
     os.environ["NO_PROXY"] = "127.0.0.1"
     os.environ["DISABLE_TELEMETRY"] = "true"
     os.environ["DISABLE_COST_WARNINGS"] = "true"
