@@ -13,6 +13,9 @@
 //
 // 5s in-process cache per provider so we don't hit the filesystem on every
 // single request, while still picking up rotated tokens promptly.
+//
+// Auto-prime: if no token file exists for a provider, we call the local
+// /__admin/prime endpoint to mint one before proceeding.
 
 const fs = require("fs");
 const path = require("path");
@@ -22,25 +25,77 @@ const ROOT = path.join(os.homedir(), ".claude-code-router");
 const TOKENS_DIR = path.join(ROOT, "tokens");
 const USED_DIR = path.join(ROOT, "used");
 const CACHE_TTL_MS = 5000;
+const PRIME_URL = "http://127.0.0.1:3456/__admin/prime";
 
 // keyed by provider.name -> { token, readAt }
 const cache = new Map();
 
-function readToken(name) {
-  const now = Date.now();
-  const hit = cache.get(name);
-  if (hit && now - hit.readAt < CACHE_TTL_MS) return hit.token;
+// Track in-flight prime requests to avoid duplicate calls
+const primeInFlight = new Map();
+
+async function primeProvider(name) {
+  // Check if already priming this provider
+  if (primeInFlight.has(name)) {
+    return primeInFlight.get(name);
+  }
+
+  const promise = (async () => {
+    try {
+      const res = await fetch(PRIME_URL, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ provider: name }),
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        console.error(`[inject-token] prime failed for ${name}: ${res.status} ${text}`);
+        return null;
+      }
+      // Token file should now exist; read it
+      const t = fs.readFileSync(path.join(TOKENS_DIR, `${name}.txt`), "utf8").trim();
+      if (t) {
+        cache.set(name, { token: t, readAt: Date.now() });
+        return t;
+      }
+    } catch (e) {
+      console.error(`[inject-token] prime error for ${name}:`, e.message);
+    }
+    return null;
+  })();
+
+  primeInFlight.set(name, promise);
+  try {
+    return await promise;
+  } finally {
+    primeInFlight.delete(name);
+  }
+}
+
+function readTokenSync(name) {
   try {
     const t = fs.readFileSync(path.join(TOKENS_DIR, `${name}.txt`), "utf8").trim();
     if (t) {
-      cache.set(name, { token: t, readAt: now });
+      cache.set(name, { token: t, readAt: Date.now() });
       return t;
     }
-  } catch (_) {
-    // Token file missing or unreadable -- fall through to whatever we have
-    // cached (possibly nothing). Empty header lets the upstream 401, which is
-    // a clearer signal than silently sending stale or no auth.
-  }
+  } catch (_) {}
+  return null;
+}
+
+async function readToken(name) {
+  const now = Date.now();
+  const hit = cache.get(name);
+  if (hit && now - hit.readAt < CACHE_TTL_MS) return hit.token;
+
+  // Try reading from disk
+  const t = readTokenSync(name);
+  if (t) return t;
+
+  // No token file - auto-prime
+  const primed = await primeProvider(name);
+  if (primed) return primed;
+
+  // Fall back to cached value if any
   return hit ? hit.token : "";
 }
 
@@ -66,7 +121,7 @@ class InjectToken {
 
   async transformRequestIn(request, provider) {
     const pname = provider && provider.name ? provider.name : "";
-    const token = pname ? readToken(pname) : "";
+    const token = pname ? await readToken(pname) : "";
     if (pname) touchUsed(pname);
     return {
       body: request,

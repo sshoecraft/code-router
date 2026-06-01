@@ -217,7 +217,7 @@ class Server {
         "preHandler",
         async (req: FastifyRequest, reply: FastifyReply) => {
           const url = new URL(`http://127.0.0.1${req.url}`);
-          if (url.pathname.endsWith("/v1/messages") && req.body) {
+          if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/chat/completions")) && req.body) {
             try {
               const body = req.body as any;
               if (!body || !body.model) {
@@ -225,8 +225,17 @@ class Server {
                   .code(400)
                   .send({ error: "Missing model in request body" });
               }
-              const [provider, ...model] = body.model.split(",");
-              body.model = model.join(",");
+              const [provider, ...modelParts] = body.model.split(",");
+              let model = modelParts.join(",");
+              // If no model specified (just provider alias), look up from provider config
+              if (!model) {
+                const providers = this.configService.get<any[]>("providers") || [];
+                const providerConfig = providers.find((p: any) => p.name === provider);
+                if (providerConfig?.models?.[0]) {
+                  model = providerConfig.models[0];
+                }
+              }
+              body.model = model;
               req.provider = provider;
               req.model = model;
               return;
