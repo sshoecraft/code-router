@@ -12,7 +12,7 @@ import { ConfigService } from "@/services/config";
 import { ProviderService } from "@/services/provider";
 import { TransformerService } from "@/services/transformer";
 import { Transformer } from "@/types/transformer";
-import { registerAdminRoutes } from "@/admin";
+import { registerAdminRoutes, primeProviderByName } from "@/admin";
 
 // Extend FastifyInstance to include custom services
 declare module "fastify" {
@@ -351,17 +351,53 @@ async function sendRequestToProvider(
     }
   }
 
-  const response = await sendUnifiedRequest(
-    url,
-    requestBody,
-    {
-      httpsProxy: fastify.configService.getHttpsProxy(),
-      ...config,
-      headers: JSON.parse(JSON.stringify(requestHeaders)),
-    },
-    context,
-    fastify.log
-  );
+  const sendOnce = (headers: Record<string, string>) =>
+    sendUnifiedRequest(
+      url,
+      requestBody,
+      {
+        httpsProxy: fastify.configService.getHttpsProxy(),
+        ...config,
+        headers: JSON.parse(JSON.stringify(headers)),
+      },
+      context,
+      fastify.log
+    );
+
+  let response = await sendOnce(requestHeaders);
+
+  // 401 from upstream usually means the OAuth bearer was revoked between
+  // refresh-timer cycles. Re-mint once and retry; on a second 401, give up.
+  // Only applies when the provider is an icode-managed one (i.e. the prime
+  // helper recognizes its name from ICODE_CFG).
+  if (response.status === 401 && provider.name) {
+    try {
+      await response.text().catch(() => undefined); // drain the failed body
+      fastify.log.warn(
+        `[provider_response_error] 401 from ${provider.name}; re-priming token and retrying once`
+      );
+      const primed = await primeProviderByName(provider.name);
+      if (primed?.token) {
+        // Strip every spelling of the existing auth headers before injecting
+        // the fresh bearer. The Anthropic transformer's auth() sets
+        // lowercase `authorization`, while inject-token sets capitalized
+        // `Authorization`; objects keep both keys distinct and the wrong one
+        // can win.
+        const retryHeaders: Record<string, string> = {};
+        for (const [k, v] of Object.entries(requestHeaders)) {
+          const lk = k.toLowerCase();
+          if (lk === "authorization" || lk === "x-api-key") continue;
+          retryHeaders[k] = v;
+        }
+        retryHeaders["Authorization"] = `Bearer ${primed.token}`;
+        response = await sendOnce(retryHeaders);
+      }
+    } catch (e: any) {
+      fastify.log.error(
+        `[provider_response_error] re-prime failed for ${provider.name}: ${e?.message ?? e}`
+      );
+    }
+  }
 
   // Handle request errors
   if (!response.ok) {

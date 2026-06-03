@@ -208,6 +208,20 @@ function findProvider(
   return p;
 }
 
+// Reusable prime: mint a fresh token for `name`, atomically write
+// tokens/<name>.txt, touch used/<name>. Used by both the /__admin/prime
+// route and the in-process 401-retry path in the request handler.
+export async function primeProviderByName(
+  name: string
+): Promise<{ token: string; expiresIn: any }> {
+  const providers = loadProviders();
+  const p = findProvider(providers, name);
+  const result = await mintToken(p);
+  writeToken(p.name, result.token);
+  touchUsed(p.name);
+  return result;
+}
+
 export async function registerAdminRoutes(fastify: FastifyInstance) {
   fastify.post<{ Body: { provider: string } }>(
     "/__admin/prime",
@@ -222,25 +236,19 @@ export async function registerAdminRoutes(fastify: FastifyInstance) {
     },
     async (req, _reply) => {
       requireLocalhost(req);
-      let providers: IcodeProvider[];
-      try {
-        providers = loadProviders();
-      } catch (e: any) {
-        throw createApiError(e.message, 500, "config_error");
-      }
-      const p = findProvider(providers, req.body.provider);
       let result;
       try {
-        result = await mintToken(p);
+        result = await primeProviderByName(req.body.provider);
       } catch (e: any) {
+        if (e?.statusCode) throw e; // already shaped by createApiError
         throw createApiError(
-          `mint failed for '${p.name}': ${e.message}`,
+          `mint failed for '${req.body.provider}': ${e.message}`,
           502,
           "mint_failed"
         );
       }
-      writeToken(p.name, result.token);
-      touchUsed(p.name);
+      const providers = loadProviders();
+      const p = findProvider(providers, req.body.provider);
       return {
         status: "ok",
         provider: p.name,

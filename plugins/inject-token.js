@@ -12,7 +12,10 @@
 // provider is still in use, so its token keeps getting refreshed.
 //
 // 5s in-process cache per provider so we don't hit the filesystem on every
-// single request, while still picking up rotated tokens promptly.
+// single request, while still picking up rotated tokens promptly. The cache
+// is invalidated when the token file's mtime advances past what we recorded,
+// so an out-of-band rotation (timer refresh, 401-driven re-prime) is visible
+// to the very next request instead of waiting up to 5s.
 //
 // Auto-prime: if no token file exists for a provider, we call the local
 // /__admin/prime endpoint to mint one before proceeding.
@@ -27,7 +30,7 @@ const USED_DIR = path.join(ROOT, "used");
 const CACHE_TTL_MS = 5000;
 const PRIME_URL = "http://127.0.0.1:3456/__admin/prime";
 
-// keyed by provider.name -> { token, readAt }
+// keyed by provider.name -> { token, readAt, mtimeMs }
 const cache = new Map();
 
 // Track in-flight prime requests to avoid duplicate calls
@@ -52,9 +55,11 @@ async function primeProvider(name) {
         return null;
       }
       // Token file should now exist; read it
-      const t = fs.readFileSync(path.join(TOKENS_DIR, `${name}.txt`), "utf8").trim();
+      const p = path.join(TOKENS_DIR, `${name}.txt`);
+      const t = fs.readFileSync(p, "utf8").trim();
       if (t) {
-        cache.set(name, { token: t, readAt: Date.now() });
+        const mtimeMs = safeMtime(p);
+        cache.set(name, { token: t, readAt: Date.now(), mtimeMs });
         return t;
       }
     } catch (e) {
@@ -71,11 +76,20 @@ async function primeProvider(name) {
   }
 }
 
-function readTokenSync(name) {
+function safeMtime(p) {
   try {
-    const t = fs.readFileSync(path.join(TOKENS_DIR, `${name}.txt`), "utf8").trim();
+    return fs.statSync(p).mtimeMs;
+  } catch (_) {
+    return 0;
+  }
+}
+
+function readTokenSync(name) {
+  const p = path.join(TOKENS_DIR, `${name}.txt`);
+  try {
+    const t = fs.readFileSync(p, "utf8").trim();
     if (t) {
-      cache.set(name, { token: t, readAt: Date.now() });
+      cache.set(name, { token: t, readAt: Date.now(), mtimeMs: safeMtime(p) });
       return t;
     }
   } catch (_) {}
@@ -85,7 +99,12 @@ function readTokenSync(name) {
 async function readToken(name) {
   const now = Date.now();
   const hit = cache.get(name);
-  if (hit && now - hit.readAt < CACHE_TTL_MS) return hit.token;
+  if (hit && now - hit.readAt < CACHE_TTL_MS) {
+    // Within the TTL window, still cheap-check mtime in case the timer or a
+    // 401-retry rewrote the file underneath us.
+    const mtimeMs = safeMtime(path.join(TOKENS_DIR, `${name}.txt`));
+    if (mtimeMs && mtimeMs === hit.mtimeMs) return hit.token;
+  }
 
   // Try reading from disk
   const t = readTokenSync(name);
