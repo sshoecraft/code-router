@@ -132,6 +132,96 @@ class Server {
     this.app.addHook(hookName as any, hookFunction);
   }
 
+  // Validate and resolve the requested model into (provider, model). Returns
+  // null after sending a 4xx reply on failure so the caller can short-circuit.
+  //   - no `model` in body  → use Router.default (400 if no default configured)
+  //   - "PROVIDER,MODEL"   → both must be in config, else 404
+  //   - "PROVIDER" alone   → substitute provider's first models[] entry
+  //   - unknown alias      → 404
+  private resolveModelOrError(
+    body: any,
+    configService: ConfigService,
+    reply: FastifyReply
+  ): { provider: string; model: string } | null {
+    const providers = configService.get<any[]>("providers") || [];
+    const Router = configService.get<any>("Router") || {};
+
+    const notFound = (requested: string) => {
+      reply.code(404).send({
+        type: "error",
+        error: {
+          type: "not_found_error",
+          message: `model: ${requested}`,
+        },
+      });
+      return null;
+    };
+
+    let requested: string | undefined = body?.model;
+    if (!requested) {
+      if (!Router.default) {
+        reply.code(400).send({
+          type: "error",
+          error: {
+            type: "invalid_request_error",
+            message: "model: Field required (no Router.default configured)",
+          },
+        });
+        return null;
+      }
+      requested = Router.default as string;
+    }
+
+    const [provider, ...modelParts] = requested.split(",");
+    const requestedModel = modelParts.join(",");
+
+    const providerConfig = providers.find((p: any) => p.name === provider);
+    if (!providerConfig) return notFound(requested);
+
+    let model: string;
+    if (requestedModel) {
+      const match = providerConfig.models?.find(
+        (m: any) =>
+          m === requestedModel ||
+          (typeof m === "string" &&
+            m.toLowerCase() === requestedModel.toLowerCase())
+      );
+      if (!match) return notFound(requested);
+      model = match;
+    } else {
+      if (!providerConfig.models?.[0]) return notFound(requested);
+      model = providerConfig.models[0];
+    }
+
+    return { provider, model };
+  }
+
+  // preHandler that validates body.model against the given namespace's
+  // configService, then sets body.model / req.provider / req.model so the
+  // downstream transformer chain sees a bare model name and the route
+  // handler sees the resolved provider.
+  private modelResolverHook(configService: ConfigService) {
+    return async (req: any, reply: any) => {
+      const url = new URL(`http://127.0.0.1${req.url}`);
+      if (
+        !(url.pathname.endsWith("/v1/messages") ||
+          url.pathname.endsWith("/v1/chat/completions")) ||
+        !req.body
+      ) {
+        return;
+      }
+      const resolved = this.resolveModelOrError(
+        req.body,
+        configService,
+        reply
+      );
+      if (!resolved) return;
+      (req.body as any).model = resolved.model;
+      req.provider = resolved.provider;
+      req.model = resolved.model;
+    };
+  }
+
   public async registerNamespace(name: string, options?: any) {
     if (!name) throw new Error("name is required");
     if (name === '/') {
@@ -140,16 +230,7 @@ class Server {
         fastify.decorate('transformerService', this.transformerService);
         fastify.decorate('providerService', this.providerService);
         fastify.decorate('tokenizerService', this.tokenizerService);
-        // Add router hook for main namespace
-        fastify.addHook('preHandler', async (req: any, reply: any) => {
-          const url = new URL(`http://127.0.0.1${req.url}`);
-          if (url.pathname.endsWith("/v1/messages")) {
-            await router(req, reply, {
-              configService: this.configService,
-              tokenizerService: this.tokenizerService,
-            });
-          }
-        });
+        fastify.addHook('preHandler', this.modelResolverHook(this.configService));
         await registerApiRoutes(fastify);
       });
       return
@@ -181,16 +262,7 @@ class Server {
       fastify.decorate('transformerService', transformerService);
       fastify.decorate('providerService', providerService);
       fastify.decorate('tokenizerService', tokenizerService);
-      // Add router hook for namespace
-      fastify.addHook('preHandler', async (req: any, reply: any) => {
-        const url = new URL(`http://127.0.0.1${req.url}`);
-        if (url.pathname.endsWith("/v1/messages")) {
-          await router(req, reply, {
-            configService,
-            tokenizerService,
-          });
-        }
-      });
+      fastify.addHook('preHandler', this.modelResolverHook(configService));
       await registerApiRoutes(fastify);
     }, { prefix: name });
   }
@@ -212,41 +284,6 @@ class Server {
       });
 
       await this.registerNamespace('/')
-
-      this.app.addHook(
-        "preHandler",
-        async (req: FastifyRequest, reply: FastifyReply) => {
-          const url = new URL(`http://127.0.0.1${req.url}`);
-          if ((url.pathname.endsWith("/v1/messages") || url.pathname.endsWith("/v1/chat/completions")) && req.body) {
-            try {
-              const body = req.body as any;
-              if (!body || !body.model) {
-                return reply
-                  .code(400)
-                  .send({ error: "Missing model in request body" });
-              }
-              const [provider, ...modelParts] = body.model.split(",");
-              let model = modelParts.join(",");
-              // If no model specified (just provider alias), look up from provider config
-              if (!model) {
-                const providers = this.configService.get<any[]>("providers") || [];
-                const providerConfig = providers.find((p: any) => p.name === provider);
-                if (providerConfig?.models?.[0]) {
-                  model = providerConfig.models[0];
-                }
-              }
-              body.model = model;
-              req.provider = provider;
-              req.model = model;
-              return;
-            } catch (err) {
-              req.log.error({error: err}, "Error in modelProviderMiddleware:");
-              return reply.code(500).send({ error: "Internal server error" });
-            }
-          }
-        }
-      );
-
 
       const address = await this.app.listen({
         port: parseInt(this.configService.get("PORT") || "3000", 10),
