@@ -15,6 +15,53 @@ import { getThinkLevel } from "@/utils/thinking";
 import { createApiError } from "@/api/middleware";
 import { formatBase64 } from "@/utils/image";
 
+// code-router patch: strip/clamp request fields the corporate Anthropic
+// gateway's older API rejects. Mutates `request` in place. Safe to call
+// repeatedly. Called from auth() (bypass path) and transformRequestIn
+// (non-bypass path, e.g. OpenAI clients hitting /v1/chat/completions).
+function applyGatewayShim(request: any): void {
+  if (!request || typeof request !== "object") return;
+
+  // context_management is a newer Claude Code beta the gateway's older
+  // API doesn't accept at all -- no equivalent shape to fall back to,
+  // so just drop it.
+  delete request.context_management;
+
+  // reasoning effort levels: clamp anything the gateway doesn't accept
+  // (e.g. "xhigh") down to "high" so the user's intent is preserved
+  // rather than dropped.
+  const supportedEfforts = new Set(["high", "medium", "low"]);
+  const clampEffort = (v: any): any =>
+    typeof v === "string" && !supportedEfforts.has(v) ? "high" : v;
+  if (typeof request.reasoning_effort === "string") {
+    request.reasoning_effort = clampEffort(request.reasoning_effort);
+  }
+  if (request.reasoning && typeof request.reasoning === "object") {
+    if (typeof request.reasoning.effort === "string") {
+      request.reasoning.effort = clampEffort(request.reasoning.effort);
+    }
+  }
+  if (request.output_config && typeof request.output_config === "object") {
+    if (typeof request.output_config.effort === "string") {
+      request.output_config.effort = clampEffort(request.output_config.effort);
+    }
+  }
+
+  // thinking: the gateway returns inconsistent errors across both the
+  // standard Anthropic shape `{ type, budget_tokens }` and the key-as-
+  // discriminator shape `{ enabled: { budget_tokens } }`, so just drop it
+  // for now. Revisit if/when the gateway's schema is documented.
+  delete request.thinking;
+
+  // The gateway rejects requests that set both `temperature` and `top_p`
+  // ("cannot both be specified for this model"). The OpenAI SDK and many
+  // benchmark clients set both by default. Keep temperature (the more
+  // commonly-tuned knob) and drop top_p so the caller's intent survives.
+  if (request.temperature !== undefined && request.top_p !== undefined) {
+    delete request.top_p;
+  }
+}
+
 export class AnthropicTransformer implements Transformer {
   name = "Anthropic";
   endPoint = "/v1/messages";
@@ -23,6 +70,18 @@ export class AnthropicTransformer implements Transformer {
 
   constructor(private readonly options?: TransformerOptions) {
     this.useBearer = this.options?.UseBearer ?? false;
+  }
+
+  // Runs in the non-bypass request transformer chain (e.g. when an OpenAI
+  // client hits /v1/chat/completions routed to an Anthropic provider). In
+  // bypass mode this isn't called -- auth() handles the same shim there.
+  // Gated on the same env vars as the auth-path shim so behavior matches
+  // upstream when the daemon isn't proxying a corporate gateway.
+  async transformRequestIn(request: any, _provider: LLMProvider): Promise<any> {
+    if (process.env.ANTHROPIC_TOKEN_DIR || process.env.ANTHROPIC_TOKEN_FILE) {
+      applyGatewayShim(request);
+    }
+    return request;
   }
 
   async auth(request: any, provider: LLMProvider): Promise<any> {
@@ -87,37 +146,8 @@ export class AnthropicTransformer implements Transformer {
     // gateway's older API rejects. Active whenever the bearer-token override
     // is active (either DIR or FILE mode). With neither env set, upstream
     // behavior is preserved unchanged.
-    if (patchActive && request && typeof request === "object") {
-      // context_management is a newer Claude Code beta the gateway's older
-      // API doesn't accept at all -- no equivalent shape to fall back to,
-      // so just drop it.
-      delete request.context_management;
-
-      // reasoning effort levels: clamp anything the gateway doesn't accept
-      // (e.g. "xhigh") down to "high" so the user's intent is preserved
-      // rather than dropped.
-      const supportedEfforts = new Set(["high", "medium", "low"]);
-      const clampEffort = (v: any): any =>
-        typeof v === "string" && !supportedEfforts.has(v) ? "high" : v;
-      if (typeof request.reasoning_effort === "string") {
-        request.reasoning_effort = clampEffort(request.reasoning_effort);
-      }
-      if (request.reasoning && typeof request.reasoning === "object") {
-        if (typeof request.reasoning.effort === "string") {
-          request.reasoning.effort = clampEffort(request.reasoning.effort);
-        }
-      }
-      if (request.output_config && typeof request.output_config === "object") {
-        if (typeof request.output_config.effort === "string") {
-          request.output_config.effort = clampEffort(request.output_config.effort);
-        }
-      }
-
-      // thinking: the gateway returns inconsistent errors across both the
-      // standard Anthropic shape `{ type, budget_tokens }` and the key-as-
-      // discriminator shape `{ enabled: { budget_tokens } }`, so just drop
-      // it for now. Revisit if/when the gateway's schema is documented.
-      delete request.thinking;
+    if (patchActive) {
+      applyGatewayShim(request);
     }
 
     const headers: Record<string, string | undefined> = {};
