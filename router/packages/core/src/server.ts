@@ -135,6 +135,7 @@ class Server {
   // Validate and resolve the requested model into (provider, model). Returns
   // null after sending a 4xx reply on failure so the caller can short-circuit.
   //   - no `model` in body  → use Router.default (400 if no default configured)
+  //   - alias in Router.aliases → substitute mapped value, then re-resolve
   //   - "PROVIDER,MODEL"   → both must be in config, else 404
   //   - "PROVIDER" alone   → substitute provider's first models[] entry
   //   - unknown alias      → 404
@@ -145,6 +146,7 @@ class Server {
   ): { provider: string; model: string } | null {
     const providers = configService.get<any[]>("providers") || [];
     const Router = configService.get<any>("Router") || {};
+    const aliases = (Router.aliases || {}) as Record<string, string>;
 
     const notFound = (requested: string) => {
       reply.code(404).send({
@@ -170,6 +172,10 @@ class Server {
         return null;
       }
       requested = Router.default as string;
+    }
+
+    if (aliases[requested]) {
+      requested = aliases[requested];
     }
 
     const [provider, ...modelParts] = requested.split(",");

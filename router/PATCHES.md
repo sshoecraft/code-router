@@ -128,3 +128,40 @@ neither env var is set, behavior matches what the transformer would do
 without the patch — so this code is safe to reuse for non-code-router
 setups that don't want the OAuth-rotation machinery.
 
+## Patch 4 — `packages/core/src/server.ts` :: `resolveModelOrError()` alias map
+
+**Why**
+
+Commit `b9bc94d` made `resolveModelOrError` 404 any model whose first
+comma-segment isn't a configured provider. That catches typos from `icode`,
+but it also rejects the model names Claude Code's official client sends by
+default (`claude-opus-4-8`, `claude-sonnet-4-6`, `claude-haiku-4-5`) when no
+`ANTHROPIC_MODEL` override is set. Pre-`b9bc94d`, those names fell through
+to `Router.default` via the scenario router and silently worked.
+
+**Patched behavior**
+
+`resolveModelOrError` now consults `Router.aliases` (a flat
+`{ requested → replacement }` map from `config.json`) immediately after
+defaulting from `Router.default`. If `requested` is a key in `aliases`, it's
+substituted before the comma-split / provider lookup runs. Unknown names
+that aren't in `aliases` still 404 — the typo-detection property the
+validator was added for is preserved.
+
+Example config:
+
+```json
+"Router": {
+  "default": "opus,mt-genai-claude-opus-4-5-20251101-preview",
+  "aliases": {
+    "claude-opus-4-8":   "opus",
+    "claude-sonnet-4-6": "opus",
+    "claude-haiku-4-5":  "opus"
+  }
+}
+```
+
+Right-hand side accepts anything `resolveModelOrError` accepts after the
+substitution — `"provider"` (uses provider's first `models[]` entry) or
+`"provider,explicit-model"`. No alias chaining (single substitution).
+
