@@ -178,6 +178,17 @@ class Server {
       requested = aliases[requested];
     }
 
+    // Fallback: if model name contains a known provider name, route to that provider
+    if (!requested.includes(",")) {
+      const lowerReq = requested.toLowerCase();
+      const providerMatch = providers.find((p: any) =>
+        lowerReq.includes(p.name.toLowerCase())
+      );
+      if (providerMatch) {
+        requested = `${providerMatch.name},${providerMatch.models?.[0] || requested}`;
+      }
+    }
+
     const [provider, ...modelParts] = requested.split(",");
     const requestedModel = modelParts.join(",");
 

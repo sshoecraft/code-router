@@ -278,7 +278,12 @@ def main() -> None:
 
     claude = shutil.which("claude")
     if not claude:
-        die("claude not on PATH (is @anthropic-ai/claude-code installed?)")
+        # Fallback: check common user-local install location
+        local_claude = HOME / ".local" / "bin" / "claude"
+        if local_claude.is_file() and os.access(local_claude, os.X_OK):
+            claude = str(local_claude)
+        else:
+            die("claude not on PATH and not found at ~/.local/bin/claude (is @anthropic-ai/claude-code installed?)")
 
     argv = [claude, "--model", f"{provider},{model}", *skip_perms, *forward]
     os.execvp(claude, argv)
