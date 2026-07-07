@@ -29,8 +29,16 @@ CCR_DIR       ?= $(PREFIX)/.claude-code-router
 PLUGIN_DIR    ?= $(CCR_DIR)/plugins
 CA_DIR        ?= $(PREFIX)/.local/share/ca-certs
 ICODE_CFG     ?= $(PREFIX)/.config/icode/config.json
+ICODE_TOML    ?= $(dir $(ICODE_CFG))config.toml
 
 ROUTER_SRC    := $(CURDIR)/router
+
+# Default daemon endpoint written into the client config.toml at install time
+# (both modes) when the file doesn't already exist. icode's resolution order is
+# env > ~/.config/icode/config.toml > /etc/icode/config.toml >
+# <prefix>/etc/icode.toml > built-in, so an operator can override this later by
+# editing the file or exporting $CODE_ROUTER_DAEMON_BASE.
+DEFAULT_ENDPOINT ?= http://127.0.0.1:3456
 
 # System-mode paths (used by install-system / uninstall-system targets).
 SYS_BIN_DIR     ?= /usr/local/bin
@@ -42,6 +50,12 @@ SYS_CFG         ?= $(SYS_CFG_DIR)/config.json
 SYS_STATE_DIR   ?= /var/lib/code-router
 SYS_SYSTEMD_DIR ?= /etc/systemd/system
 SYS_USER        ?= code-router
+# System-wide client config lives under the install prefix (/usr/local), not
+# /etc/icode -- the latter is 0750 root:code-router so non-daemon users can't
+# read it. /usr/local/etc is world-readable, matching icode's <prefix>/etc
+# candidate for /usr/local/bin/icode.
+SYS_ETC_DIR     ?= /usr/local/etc
+SYS_ICODE_TOML  ?= $(SYS_ETC_DIR)/icode.toml
 
 .PHONY: install install-user uninstall status refresh check-prereqs \
         install-router install-bin install-plugin install-ca install-systemd \
@@ -49,7 +63,9 @@ SYS_USER        ?= code-router
         install-system uninstall-system check-prereqs-system \
         install-system-user install-system-dirs install-system-bin \
         install-system-plugin install-system-router install-system-ca \
-        install-system-systemd configure-system
+        install-system-systemd configure-system \
+        install-icode install-icode-user install-icode-system \
+        seed-icode-config seed-icode-config-system
 
 # `make install` dispatches based on caller: root -> system install (the
 # obvious thing for a sudo'd "install everything" run), non-root -> per-user
@@ -133,7 +149,7 @@ install-bin: | $(BIN_DIR)
 	install -m 0755 bin/icode                     $(BIN_DIR)/icode
 	install -m 0755 bin/code-router-refresh-token $(BIN_DIR)/code-router-refresh-token
 
-install-plugin: | $(PLUGIN_DIR)
+install-plugin: seed-icode-config | $(PLUGIN_DIR)
 	install -m 0644 plugins/strip-reasoning.js $(PLUGIN_DIR)/strip-reasoning.js
 	install -m 0644 plugins/inject-token.js    $(PLUGIN_DIR)/inject-token.js
 	@install -d -m 0700 $(CCR_DIR)/tokens
@@ -250,7 +266,7 @@ install-system-user:
 		echo "System user '$(SYS_USER)' already exists."; \
 	fi
 
-install-system-dirs:
+install-system-dirs: seed-icode-config-system
 	@install -d -m 0755 -o root -g root              $(SYS_BIN_DIR)
 	@install -d -m 0755 -o root -g root              $(SYS_SHARE_DIR)
 	@install -d -m 0755 -o root -g root              $(SYS_PLUGIN_DIR)
@@ -355,3 +371,48 @@ uninstall-system:
 	@echo "  sudo rm -rf $(SYS_CFG_DIR) $(SYS_STATE_DIR)"
 	@echo "  sudo userdel $(SYS_USER)"
 	@echo "  sudo npm uninstall -g @musistudio/claude-code-router"
+
+# ----------------------------------------------------------------------------
+# Convenience: install ONLY the icode launcher (no router rebuild, no systemd,
+# no plugins) plus its seeded client config. Dispatches by uid like `install`:
+#   make install-icode        # per-user -> ~/.local/bin + ~/.config/icode/config.toml
+#   sudo make install-icode   # system   -> /usr/local/bin + /usr/local/etc/icode.toml
+# The seed-icode-config* targets are shared with the full install so the
+# default endpoint is defined in exactly one place (DEFAULT_ENDPOINT).
+# ----------------------------------------------------------------------------
+
+install-icode:
+	@if [ "$$(id -u)" = "0" ] && [ -z "$(ALLOW_ROOT_USER_INSTALL)" ]; then \
+		$(MAKE) install-icode-system; \
+	else \
+		$(MAKE) install-icode-user; \
+	fi
+
+install-icode-user: seed-icode-config | $(BIN_DIR)
+	install -m 0755 bin/icode $(BIN_DIR)/icode
+	@echo "Installed icode -> $(BIN_DIR)/icode"
+
+install-icode-system: seed-icode-config-system
+	@install -m 0755 bin/icode $(SYS_BIN_DIR)/icode
+	@echo "Installed icode -> $(SYS_BIN_DIR)/icode"
+
+# Seed the per-user client config.toml with the default endpoint if absent.
+seed-icode-config:
+	@mkdir -p $(dir $(ICODE_CFG))
+	@if [ ! -e $(ICODE_TOML) ]; then \
+		printf 'endpoint = "%s"\n' '$(DEFAULT_ENDPOINT)' > $(ICODE_TOML); \
+		echo "Created $(ICODE_TOML) (endpoint = $(DEFAULT_ENDPOINT))"; \
+	else \
+		echo "Kept existing $(ICODE_TOML)"; \
+	fi
+
+# Seed the system-wide client icode.toml (world-readable, under /usr/local/etc).
+seed-icode-config-system:
+	@install -d -m 0755 -o root -g root $(SYS_ETC_DIR)
+	@if [ ! -e $(SYS_ICODE_TOML) ]; then \
+		printf 'endpoint = "%s"\n' '$(DEFAULT_ENDPOINT)' > $(SYS_ICODE_TOML); \
+		chmod 0644 $(SYS_ICODE_TOML); \
+		echo "Created $(SYS_ICODE_TOML) (endpoint = $(DEFAULT_ENDPOINT))"; \
+	else \
+		echo "Kept existing $(SYS_ICODE_TOML)"; \
+	fi

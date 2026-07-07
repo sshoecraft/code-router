@@ -22,6 +22,9 @@ make install               # per-user (or system, if uid 0) — dispatches on ui
 make install-user          # explicit per-user install
 sudo make install-system   # explicit system-wide install
 
+make install-icode         # just the icode launcher + seeded config.toml, no
+                           # router rebuild/systemd/plugins (dispatches on uid)
+
 make configure             # phase-2: CA fetch + initial token mint (per-user)
 sudo make configure-system # phase-2 for system install
 
@@ -201,6 +204,21 @@ a sibling `default.toml`: one line, `provider = "NAME"`. If the file doesn't
 exist and the user doesn't pass `--provider`, `icode` errors out rather than
 guessing. Set the default by editing the file directly (no CLI command).
 Template at `default.toml.example`.
+
+The daemon endpoint `icode` connects to defaults to `http://127.0.0.1:3456`
+but is configurable — useful for pointing a client at a remote daemon (e.g. a
+shared cadev host). Resolution order, first hit wins: `$CODE_ROUTER_DAEMON_BASE`,
+then an `endpoint = "URL"` line in `~/.config/icode/config.toml`,
+`/etc/icode/config.toml`, or `<install-prefix>/etc/icode.toml` (for
+`/usr/local/bin/icode` that's `/usr/local/etc/icode.toml`), else the default.
+Only the `endpoint` key is read; a trailing slash is stripped.
+
+`make install` seeds this file with the default endpoint when it doesn't exist
+— per-user at `~/.config/icode/config.toml`, system at `/usr/local/etc/icode.toml`
+— and never overwrites an existing one, so an operator's edits survive
+reinstalls. System mode writes `/usr/local/etc/icode.toml` (candidate #4) rather
+than `/etc/icode/config.toml` (candidate #3) because `/etc/icode` is
+`0750 root:code-router` and unreadable to the non-daemon users who run `icode`.
 
 Daemon admin endpoints (used by `icode`):
 - `POST /__admin/prime` body `{"provider": "NAME"}` — mint NAME's token,

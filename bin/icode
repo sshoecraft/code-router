@@ -26,6 +26,11 @@ Install modes (auto-detected from $0's directory):
   /usr/local/bin/icode  -> system mode (daemon started by systemd at boot)
   anywhere else         -> per-user mode (daemon spawned lazily by `ccr start`)
 
+Daemon endpoint (first match wins):
+  $CODE_ROUTER_DAEMON_BASE, else `endpoint = "URL"` from
+  ~/.config/icode/config.toml, /etc/icode/config.toml, or
+  <install-prefix>/etc/icode.toml, else http://127.0.0.1:3456.
+
 Flags consumed here (NOT forwarded to claude-code):
   --provider NAME   route this session to NAME (NOT a global switch)
   --list            list configured providers and exit
@@ -35,6 +40,7 @@ Flags consumed here (NOT forwarded to claude-code):
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -50,7 +56,55 @@ HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 SYSTEM_MODE = str(SCRIPT_DIR) == "/usr/local/bin"
 
-DAEMON_BASE = os.environ.get("CODE_ROUTER_DAEMON_BASE", "http://127.0.0.1:3456")
+# The daemon base URL icode talks to. Resolution order, first hit wins:
+#   1. $CODE_ROUTER_DAEMON_BASE            explicit per-invocation override
+#   2. ~/.config/icode/config.toml         per-user config
+#   3. /etc/icode/config.toml              system config
+#   4. <install-prefix>/etc/icode.toml     prefix-relative to this script
+#                                          (.../bin/icode -> .../etc/icode.toml)
+#   5. http://127.0.0.1:3456               built-in default
+# Config files are TOML; only the top-level `endpoint = "URL"` key is read,
+# other keys are ignored. Any trailing slash is stripped so `DAEMON_BASE +
+# "/health"` never doubles up.
+DEFAULT_DAEMON_BASE = "http://127.0.0.1:3456"
+ENDPOINT_RE = re.compile(r'^\s*endpoint\s*=\s*(.+?)\s*(?:#.*)?$', re.MULTILINE)
+
+
+def strip_quotes(s: str) -> str:
+    if len(s) >= 2 and s[0] == s[-1] and s[0] in ('"', "'"):
+        return s[1:-1]
+    return s
+
+
+def endpoint_from_toml(path: Path) -> str | None:
+    """Return the `endpoint` value from a config.toml, or None if the file is
+    absent/unreadable or defines no endpoint."""
+    try:
+        text = path.read_text()
+    except OSError:
+        return None
+    m = ENDPOINT_RE.search(text)
+    if not m:
+        return None
+    return strip_quotes(m.group(1).strip()) or None
+
+
+def resolve_daemon_base() -> str:
+    override = os.environ.get("CODE_ROUTER_DAEMON_BASE")
+    if override:
+        return override.rstrip("/")
+    for path in (
+        HOME / ".config" / "icode" / "config.toml",
+        Path("/etc/icode/config.toml"),
+        SCRIPT_DIR.parent / "etc" / "icode.toml",
+    ):
+        endpoint = endpoint_from_toml(path)
+        if endpoint:
+            return endpoint.rstrip("/")
+    return DEFAULT_DAEMON_BASE
+
+
+DAEMON_BASE = resolve_daemon_base()
 
 # Per-user mode only: when we have to spawn the daemon ourselves, we tell it
 # where its icode config lives via ICODE_CFG. icode itself never reads this
