@@ -211,7 +211,8 @@ shared cadev host). Resolution order, first hit wins: `$CODE_ROUTER_DAEMON_BASE`
 then an `endpoint = "URL"` line in `~/.config/icode/config.toml`,
 `/etc/icode/config.toml`, or `<install-prefix>/etc/icode.toml` (for
 `/usr/local/bin/icode` that's `/usr/local/etc/icode.toml`), else the default.
-Only the `endpoint` key is read; a trailing slash is stripped.
+A trailing slash on the endpoint is stripped. Two more keys, `apikey` and
+`provider`, are read when the endpoint is **remote** (see below).
 
 `make install` seeds this file with the default endpoint when it doesn't exist
 — per-user at `~/.config/icode/config.toml`, system at `/usr/local/etc/icode.toml`
@@ -219,6 +220,30 @@ Only the `endpoint` key is read; a trailing slash is stripped.
 reinstalls. System mode writes `/usr/local/etc/icode.toml` (candidate #4) rather
 than `/etc/icode/config.toml` (candidate #3) because `/etc/icode` is
 `0750 root:code-router` and unreadable to the non-daemon users who run `icode`.
+
+**Local vs remote endpoint.** icode treats a loopback endpoint (the default)
+and a remote one differently, because the daemon's `/__admin/*` endpoints are
+localhost-only (`requireLocalhost`, 403 to any non-loopback caller):
+
+- **loopback** — full flow: spawn the daemon on demand (per-user mode) and use
+  the admin endpoints to prime the token and look up the model.
+- **remote** — thin client: never spawns `ccr`, never calls the admin
+  endpoints. It drives the daemon as a plain gateway — the server-side resolver
+  maps the provider name to a model, and the remote daemon's own refresh timer
+  keeps tokens warm. Requires two extra `config.toml` keys: `apikey = "sk-..."`
+  (the daemon's `APIKEY`, since `/__admin/apikey` is unreachable) and, unless
+  `--provider` is passed, `provider = "NAME"` (since `/__admin/default` is
+  unreachable). An unreachable remote endpoint errors honestly ("remote daemon
+  unreachable at …") instead of reaching for `ccr`. Example:
+
+  ```toml
+  endpoint = "http://10.30.167.5:3456"
+  apikey   = "sk-..."
+  provider = "gpt54"
+  ```
+
+  `icode --list` is unavailable remotely for the same reason (enumeration is
+  loopback-only); pass `--provider NAME` directly.
 
 Daemon admin endpoints (used by `icode`):
 - `POST /__admin/prime` body `{"provider": "NAME"}` — mint NAME's token,

@@ -31,6 +31,15 @@ Daemon endpoint (first match wins):
   ~/.config/icode/config.toml, /etc/icode/config.toml, or
   <install-prefix>/etc/icode.toml, else http://127.0.0.1:3456.
 
+Local vs remote endpoint:
+  loopback endpoint -> full flow: spawn the daemon on demand (per-user) and
+    use the localhost-only admin endpoints to prime + look up the model.
+  remote endpoint   -> thin client: never touch ccr, never call the (localhost
+    -only) admin endpoints. Drive the daemon as a plain gateway -- it resolves
+    the model server-side and its own timer keeps tokens warm. Needs two extra
+    config.toml keys: `apikey = "sk-..."` (the daemon's APIKEY) and, unless
+    --provider is passed, `provider = "NAME"` (the default provider).
+
 Flags consumed here (NOT forwarded to claude-code):
   --provider NAME   route this session to NAME (NOT a global switch)
   --list            list configured providers and exit
@@ -56,18 +65,22 @@ HOME = Path.home()
 SCRIPT_DIR = Path(__file__).resolve().parent
 SYSTEM_MODE = str(SCRIPT_DIR) == "/usr/local/bin"
 
-# The daemon base URL icode talks to. Resolution order, first hit wins:
-#   1. $CODE_ROUTER_DAEMON_BASE            explicit per-invocation override
-#   2. ~/.config/icode/config.toml         per-user config
-#   3. /etc/icode/config.toml              system config
-#   4. <install-prefix>/etc/icode.toml     prefix-relative to this script
+# icode reads a small TOML client config (first existing file that defines a
+# given key wins):
+#   1. ~/.config/icode/config.toml         per-user
+#   2. /etc/icode/config.toml              system
+#   3. <install-prefix>/etc/icode.toml     prefix-relative to this script
 #                                          (.../bin/icode -> .../etc/icode.toml)
-#   5. http://127.0.0.1:3456               built-in default
-# Config files are TOML; only the top-level `endpoint = "URL"` key is read,
-# other keys are ignored. Any trailing slash is stripped so `DAEMON_BASE +
-# "/health"` never doubles up.
+# Recognized keys:
+#   endpoint = "URL"     daemon base URL (default http://127.0.0.1:3456;
+#                        $CODE_ROUTER_DAEMON_BASE overrides everything)
+#   apikey   = "sk-..."  daemon APIKEY  -- required for a REMOTE endpoint
+#   provider = "NAME"    default provider -- for a REMOTE endpoint
+# apikey/provider matter only when the endpoint is non-loopback (remote): the
+# daemon's admin endpoints are localhost-only, so a remote icode can't prime,
+# look up the model, or read the APIKEY. It drives the daemon as a plain
+# gateway instead (see main()).
 DEFAULT_DAEMON_BASE = "http://127.0.0.1:3456"
-ENDPOINT_RE = re.compile(r'^\s*endpoint\s*=\s*(.+?)\s*(?:#.*)?$', re.MULTILINE)
 
 
 def strip_quotes(s: str) -> str:
@@ -76,32 +89,46 @@ def strip_quotes(s: str) -> str:
     return s
 
 
-def endpoint_from_toml(path: Path) -> str | None:
-    """Return the `endpoint` value from a config.toml, or None if the file is
-    absent/unreadable or defines no endpoint."""
-    try:
-        text = path.read_text()
-    except OSError:
-        return None
-    m = ENDPOINT_RE.search(text)
-    if not m:
-        return None
-    return strip_quotes(m.group(1).strip()) or None
+def config_candidates() -> tuple[Path, ...]:
+    # Built at call time (not frozen at import) so HOME/SCRIPT_DIR overrides
+    # in tests take effect.
+    return (
+        HOME / ".config" / "icode" / "config.toml",
+        Path("/etc/icode/config.toml"),
+        SCRIPT_DIR.parent / "etc" / "icode.toml",
+    )
+
+
+def config_value(key: str) -> str | None:
+    """Value of top-level `key = "..."` from the first config.toml that defines
+    it, or None. Strips quotes, an inline comment, and surrounding whitespace."""
+    pat = re.compile(rf'^\s*{re.escape(key)}\s*=\s*(.+?)\s*(?:#.*)?$', re.MULTILINE)
+    for path in config_candidates():
+        try:
+            text = path.read_text()
+        except OSError:
+            continue
+        m = pat.search(text)
+        if m:
+            val = strip_quotes(m.group(1).strip())
+            if val:
+                return val
+    return None
 
 
 def resolve_daemon_base() -> str:
     override = os.environ.get("CODE_ROUTER_DAEMON_BASE")
     if override:
         return override.rstrip("/")
-    for path in (
-        HOME / ".config" / "icode" / "config.toml",
-        Path("/etc/icode/config.toml"),
-        SCRIPT_DIR.parent / "etc" / "icode.toml",
-    ):
-        endpoint = endpoint_from_toml(path)
-        if endpoint:
-            return endpoint.rstrip("/")
-    return DEFAULT_DAEMON_BASE
+    endpoint = config_value("endpoint")
+    return endpoint.rstrip("/") if endpoint else DEFAULT_DAEMON_BASE
+
+
+def endpoint_is_local() -> bool:
+    """True when DAEMON_BASE points at loopback -- the only case where icode
+    may spawn the daemon and use the localhost-only admin endpoints."""
+    host = (urllib.parse.urlparse(DAEMON_BASE).hostname or "").lower()
+    return host in ("127.0.0.1", "localhost", "::1", "")
 
 
 DAEMON_BASE = resolve_daemon_base()
@@ -155,9 +182,21 @@ def daemon_alive() -> bool:
 
 
 def ensure_daemon_running() -> None:
-    """Per-user mode only: start the daemon if it isn't already running.
-    System mode is handled by systemd at boot; this function is a no-op
-    there."""
+    """Make sure the daemon we'll talk to is reachable. Only a local per-user
+    endpoint is ours to spawn on demand; a remote or system-managed daemon is
+    checked for reachability but never started."""
+    # A non-loopback endpoint is a daemon we don't own -- never reach for ccr;
+    # just require it be reachable, with an honest error if it isn't.
+    if not endpoint_is_local():
+        if not daemon_alive():
+            die(
+                "remote daemon unreachable at "
+                + DAEMON_BASE
+                + " (check the host is up and reachable, and the endpoint in "
+                "your config.toml)"
+            )
+        return
+
     if SYSTEM_MODE:
         if not daemon_alive():
             die(
@@ -237,6 +276,14 @@ def lookup_model(name: str) -> str:
 def cmd_list() -> None:
     """Pretty-print the configured providers. Falls back to a direct config
     read if the daemon isn't reachable -- handy for diagnosing setup."""
+    if not endpoint_is_local():
+        die(
+            "--list uses the localhost-only admin API and isn't available for "
+            "the remote endpoint " + DAEMON_BASE + "\n"
+            "  provider names live in the daemon's config; pass "
+            "--provider NAME (the daemon resolves the model)",
+            code=2,
+        )
     if daemon_alive():
         status, body = daemon_get("/__admin/providers")
         if status >= 400:
@@ -283,39 +330,79 @@ def main() -> None:
 
     ensure_daemon_running()
 
+    remote = not endpoint_is_local()
+
     provider = args.provider
     if not provider:
-        status, body = daemon_get("/__admin/default")
-        if status == 200:
-            provider = body.strip()
-        elif status == 404:
+        if remote:
+            # /__admin/default is localhost-only; take the default provider
+            # from the local config.toml instead.
+            provider = config_value("provider")
+            if not provider:
+                die(
+                    "no provider for the remote endpoint\n"
+                    "  add `provider = \"NAME\"` to your config.toml or pass "
+                    "--provider NAME",
+                    code=2,
+                )
+        else:
+            status, body = daemon_get("/__admin/default")
+            if status == 200:
+                provider = body.strip()
+            elif status == 404:
+                die(
+                    "no default configured and no provider specified\n"
+                    "  set default.toml next to your icode config "
+                    "(provider = \"NAME\") or pass --provider NAME",
+                    code=2,
+                )
+            else:
+                try:
+                    msg = json.loads(body).get("error", {}).get("message", body)
+                except json.JSONDecodeError:
+                    msg = body
+                die(f"default lookup failed: {msg}")
+
+    # Env that points claude-code at the daemon. We exec claude directly
+    # (rather than `ccr code`) to avoid the isServiceRunning() check, which
+    # looks at the calling user's pid file (wrong in system mode, fragile
+    # per-user).
+    os.environ["ANTHROPIC_BASE_URL"] = DAEMON_BASE
+
+    if remote:
+        # The localhost-only admin endpoints (prime/model/apikey) can't be
+        # reached from here, so drive the daemon as a plain gateway: it
+        # resolves the model server-side from the provider name and keeps
+        # tokens warm via its own refresh timer. The APIKEY must be supplied
+        # locally (config.toml `apikey` or $ANTHROPIC_AUTH_TOKEN).
+        apikey = config_value("apikey") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
+        if not apikey:
             die(
-                "no default configured and no provider specified\n"
-                "  set default.toml next to your icode config "
-                "(provider = \"NAME\") or pass --provider NAME",
+                "no apikey for the remote endpoint\n"
+                "  add `apikey = \"sk-...\"` (the daemon's APIKEY) to your "
+                "config.toml, or export ANTHROPIC_AUTH_TOKEN",
                 code=2,
             )
-        else:
-            try:
-                msg = json.loads(body).get("error", {}).get("message", body)
-            except json.JSONDecodeError:
-                msg = body
-            die(f"default lookup failed: {msg}")
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = apikey
+        # Pin claude-code's background/small model to the same provider so it
+        # doesn't fall back to a default name the daemon maps elsewhere.
+        os.environ["ANTHROPIC_SMALL_FAST_MODEL"] = provider
+        model_arg = provider
+    else:
+        prime_provider(provider)
+        model = lookup_model(provider)
+        # If the daemon has APIKEY set (operator opened network access via
+        # HOST), /v1/messages needs it. Fetch via the loopback-only admin
+        # endpoint; fall back to "test" when no key is configured.
+        status, body = daemon_get("/__admin/apikey")
+        os.environ["ANTHROPIC_AUTH_TOKEN"] = (
+            body.strip() if status == 200 and body.strip() else "test"
+        )
+        model_arg = f"{provider},{model}"
 
-    prime_provider(provider)
-    model = lookup_model(provider)
-
-    # Env that points claude-code at the local daemon. Mirrors what `ccr code`
-    # would have done, but we exec claude directly to avoid the
-    # isServiceRunning() check, which looks at the calling user's pid file
-    # (wrong location in system mode, fragile in per-user mode).
-    os.environ["ANTHROPIC_BASE_URL"] = DAEMON_BASE
-    # If the daemon has APIKEY set (operator opened network access via HOST),
-    # requests to /v1/messages need it. Fetch via the loopback-only admin
-    # endpoint; falls back to "test" when no key is configured.
-    status, body = daemon_get("/__admin/apikey")
-    os.environ["ANTHROPIC_AUTH_TOKEN"] = body.strip() if status == 200 and body.strip() else "test"
-    os.environ["NO_PROXY"] = "127.0.0.1"
+    # Keep the daemon host out of any configured HTTP proxy.
+    daemon_host = urllib.parse.urlparse(DAEMON_BASE).hostname or "127.0.0.1"
+    os.environ["NO_PROXY"] = ",".join(dict.fromkeys(["127.0.0.1", daemon_host]))
     os.environ["DISABLE_TELEMETRY"] = "true"
     os.environ["DISABLE_COST_WARNINGS"] = "true"
     os.environ.setdefault("API_TIMEOUT_MS", "600000")
@@ -339,7 +426,7 @@ def main() -> None:
         else:
             die("claude not on PATH and not found at ~/.local/bin/claude (is @anthropic-ai/claude-code installed?)")
 
-    argv = [claude, "--model", f"{provider},{model}", *skip_perms, *forward]
+    argv = [claude, "--model", model_arg, *skip_perms, *forward]
     os.execvp(claude, argv)
 
 
